@@ -1,0 +1,1002 @@
+import asyncio
+import base64
+import json
+import threading
+from datetime import timedelta
+from http import HTTPStatus
+from typing import Any, cast
+from unittest import mock
+
+import httpx2
+import pytest
+from authlib.integrations.base_client.errors import MismatchingStateError, OAuthError
+from fastapi import status
+from fastapi.testclient import TestClient
+from joserfc.errors import InvalidClaimError
+
+from config import OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS
+from endpoints import permissions as permissions_endpoints
+from endpoints import user as user_endpoints
+from handler.auth import auth_handler
+from handler.auth import base_handler as auth_handler_module
+from handler.auth import oauth_handler
+from handler.auth.constants import SESSION_COOKIE_NAME
+from handler.auth.middleware.redis_session_middleware import RedisSessionMiddleware
+from handler.database import (
+    db_device_handler,
+    db_notification_handler,
+)
+from handler.database.users_handler import DBUsersHandler
+from handler.device_install import device_install_handler
+from handler.redis_handler import async_cache, redis_client
+from models.device import Device
+from models.notification import NotificationKind
+from models.user import Role, User
+
+
+def test_login_logout(client, admin_user: User):
+    response = client.get("/api/login")
+
+    assert response.status_code == status.HTTP_405_METHOD_NOT_ALLOWED
+
+    basic_auth = base64.b64encode(b"test_admin:test_admin_password").decode("ascii")
+    response = client.post(
+        "/api/login", headers={"Authorization": f"Basic {basic_auth}"}
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.cookies.get("romm_session")
+
+    response = client.post("/api/logout")
+
+    assert response.status_code == status.HTTP_200_OK
+
+
+@pytest.mark.parametrize("known", [True, False])
+def test_forgot_password_answers_alike_and_sends_the_link_afterwards(
+    client, admin_user: User, known: bool
+):
+    with mock.patch.object(auth_handler, "send_password_reset_link") as send_link:
+        response = client.post(
+            "/api/forgot-password",
+            json={"username": admin_user.username if known else "nobody"},
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json() is None
+    if known:
+        send_link.assert_called_once()
+        assert send_link.call_args.args[0].id == admin_user.id
+    else:
+        send_link.assert_not_called()
+
+
+def test_get_all_users(client, access_token: str):
+    response = client.get(
+        "/api/users", headers={"Authorization": f"Bearer {access_token}"}
+    )
+    assert response.status_code == status.HTTP_200_OK
+
+    users = response.json()
+    assert len(users) == 1
+    assert users[0]["username"] == "test_admin"
+
+
+def test_get_user(client, access_token: str, editor_user: User):
+    response = client.get(
+        f"/api/users/{editor_user.id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+
+    user = response.json()
+    assert user["username"] == "test_editor"
+
+
+@mock.patch("endpoints.user.fs_asset_handler.validate_path")
+def test_get_user_avatar(
+    mock_validate_path, client, viewer_access_token: str, admin_user: User, tmp_path
+):
+    from handler.database import db_user_handler
+
+    db_user_handler.update_user(
+        admin_user.id,
+        {"avatar_path": f"users/{admin_user.fs_safe_folder_name}/profile/avatar.png"},
+    )
+    avatar = tmp_path / "avatar.png"
+    avatar.write_bytes(b"PNGDATA")
+    mock_validate_path.return_value = avatar
+
+    # Any authenticated user can read any user's avatar.
+    response = client.get(
+        f"/api/users/{admin_user.id}/avatar",
+        headers={"Authorization": f"Bearer {viewer_access_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.content == b"PNGDATA"
+    assert response.headers["content-type"].startswith("image/")
+
+
+def test_refresh_ra_for_another_user_is_forbidden(
+    client, viewer_access_token: str, admin_user: User
+):
+    # Rejected on ownership before the user is looked up, so it does not depend
+    # on the target having a RetroAchievements username set.
+    response = client.post(
+        f"/api/users/{admin_user.id}/ra/refresh",
+        headers={"Authorization": f"Bearer {viewer_access_token}"},
+    )
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+def test_get_user_avatar_none_set(client, access_token: str, admin_user: User):
+    response = client.get(
+        f"/api/users/{admin_user.id}/avatar",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
+@pytest.mark.parametrize("new_user_role", [Role.USER, Role.ADMIN])
+def test_add_user_from_admin_user(client, access_token: str, new_user_role: Role):
+    response = client.post(
+        "/api/users",
+        json={
+            "username": "new_user",
+            "password": "new_user_password",
+            "email": "new_user@example.com",
+            "role": new_user_role.value,
+        },
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == HTTPStatus.CREATED
+
+    user = response.json()
+    assert user["username"] == "new_user"
+    assert user["role"] == new_user_role.value
+
+
+@pytest.mark.parametrize(
+    "fixture_requesting_user, existing_admin_users, expected_status_code",
+    [
+        ("editor_user", False, HTTPStatus.CREATED),
+        ("editor_user", True, HTTPStatus.FORBIDDEN),
+        ("viewer_user", False, HTTPStatus.CREATED),
+        ("viewer_user", True, HTTPStatus.FORBIDDEN),
+    ],
+)
+def test_add_user_from_unauthorized_user(
+    request,
+    client,
+    admin_user: User,
+    fixture_requesting_user: User,
+    existing_admin_users: list[User],
+    expected_status_code: int,
+):
+    requesting_user = request.getfixturevalue(fixture_requesting_user)
+
+    data = {
+        "sub": requesting_user.username,
+        "iss": "romm:oauth",
+        "scopes": " ".join(requesting_user.oauth_scopes),
+    }
+    access_token = oauth_handler.create_access_token(
+        data=data, expires_delta=timedelta(seconds=OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS)
+    )
+
+    with mock.patch.object(
+        DBUsersHandler,
+        "get_admin_users",
+        return_value=[admin_user] if existing_admin_users else [],
+    ):
+        response = client.post(
+            "/api/users",
+            json={
+                "username": "new_user",
+                "password": "new_user_password",
+                "email": "new_user@example.com",
+                "role": Role.USER.value,
+            },
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        assert response.status_code == expected_status_code
+
+
+def test_add_user_with_existing_username(client, access_token: str, admin_user: User):
+    response = client.post(
+        "/api/users",
+        json={
+            "username": admin_user.username,
+            "password": "new_user_password",
+            "email": "new_user@example.com",
+            "role": Role.USER.value,
+        },
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+
+    response = response.json()
+    assert response["detail"] == f"Username {admin_user.username} already exists"
+
+
+def test_update_user(client, access_token: str, editor_user: User):
+    assert editor_user.role == Role.USER
+
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        data={"username": "editor_user_new_username", "role": "user"},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+
+    user = response.json()
+    assert user["role"] == "user"
+
+
+def test_role_change_notifies_the_user(
+    client, access_token: str, admin_user: User, editor_user: User
+):
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        data={"role": "admin"},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+
+    [notification] = db_notification_handler.get_notifications(editor_user.id)
+    assert notification.kind == NotificationKind.ROLE_CHANGED
+    assert notification.actor_id == admin_user.id
+    assert notification.data == {"role": "admin"}
+
+
+def test_resubmitting_the_same_role_notifies_nobody(
+    client, access_token: str, editor_user: User
+):
+    client.put(
+        f"/api/users/{editor_user.id}",
+        data={"role": "user"},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    assert db_notification_handler.get_notifications(editor_user.id) == []
+
+
+def test_update_user_rejects_non_image_avatar(
+    client, access_token: str, editor_user: User
+):
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        files={"avatar": ("avatar.png", b"<script>alert(1)</script>", "image/png")},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "PNG, JPEG, WebP, or GIF" in response.json()["detail"]
+
+
+def test_update_user_accepts_png_avatar(
+    client, access_token: str, editor_user: User, tmp_path, monkeypatch
+):
+    # Redirect ASSETS_BASE_PATH to a per-test tmp dir so the written avatar
+    # doesn't leak into the repo's romm_test/ tree.
+    from handler.filesystem import fs_asset_handler
+
+    monkeypatch.setattr(fs_asset_handler, "base_path", str(tmp_path))
+
+    # Minimal valid PNG (1x1 transparent pixel)
+    png_bytes = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\rIDATx\x9cc\xfc\xff\xff?\x00\x05\xfe\x02\xfe\xa75\x81\x84"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        files={"avatar": ("payload.html", png_bytes, "image/png")},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    # Server picks the extension from the detected MIME, not the user-supplied filename.
+    assert response.json()["avatar_path"].endswith("avatar.png")
+
+
+def _invite_token(client, access_token: str) -> str:
+    response = client.post(
+        "/api/users/invite-link",
+        params={"role": Role.USER.value},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == HTTPStatus.CREATED
+    return cast(str, response.json()["token"])
+
+
+def test_register_with_a_bad_token_does_not_disclose_existing_accounts(
+    client, access_token: str, editor_user: User
+):
+    """The token is checked first, so the duplicate-account errors below it
+    cannot be used to enumerate accounts without a valid invite."""
+    response = client.post(
+        "/api/users/register",
+        json={
+            "username": editor_user.username,
+            "email": "someone@example.com",
+            "password": "a-good-password",
+            "token": "not-a-real-token",
+        },
+    )
+
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert editor_user.username not in response.json()["detail"]
+
+
+def test_a_rejected_registration_leaves_the_invite_usable(
+    client, access_token: str, editor_user: User
+):
+    token = _invite_token(client, access_token)
+
+    # Rejected on the duplicate username, after the token was checked.
+    response = client.post(
+        "/api/users/register",
+        json={
+            "username": editor_user.username,
+            "email": "someone@example.com",
+            "password": "a-good-password",
+            "token": token,
+        },
+    )
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+
+    # The invite was verified, not spent, so it still registers an account.
+    response = client.post(
+        "/api/users/register",
+        json={
+            "username": "test_invitee",
+            "email": "invitee@example.com",
+            "password": "a-good-password",
+            "token": token,
+        },
+    )
+    assert response.status_code == HTTPStatus.CREATED
+
+    # And now it is spent.
+    response = client.post(
+        "/api/users/register",
+        json={
+            "username": "test_invitee_2",
+            "email": "invitee2@example.com",
+            "password": "a-good-password",
+            "token": token,
+        },
+    )
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+
+
+def test_overlapping_registrations_spend_one_invite_once(client, access_token: str):
+    """Two registrations racing on one invite must not both create an account."""
+    from handler.database import db_user_handler
+
+    token = _invite_token(client, access_token)
+    # Hold each request at the token check until the other arrives, so the only
+    # thing that can keep the second out is the consume being one operation.
+    rendezvous = threading.Barrier(2)
+    live_redis = redis_client
+
+    class _RendezvousRedis:
+        def get(self, key, *args, **kwargs):
+            value = live_redis.get(key, *args, **kwargs)
+            if key.startswith("invite-jti:"):
+                rendezvous.wait(timeout=30)
+            return value
+
+        def __getattr__(self, name):
+            return getattr(live_redis, name)
+
+    responses: list[httpx2.Response] = []
+
+    def register(index: int) -> None:
+        responses.append(
+            client.post(
+                "/api/users/register",
+                json={
+                    "username": f"test_racer_{index}",
+                    "email": f"racer{index}@example.com",
+                    "password": "a-good-password",
+                    "token": token,
+                },
+            )
+        )
+
+    with mock.patch.object(auth_handler_module, "redis_client", _RendezvousRedis()):
+        threads = [threading.Thread(target=register, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    created = [r for r in responses if r.status_code == HTTPStatus.CREATED]
+    assert len(created) == 1
+
+    rejected = [r for r in responses if r.status_code == HTTPStatus.BAD_REQUEST]
+    assert [r.json()["detail"] for r in rejected] == [
+        "Invite token has already been used or is invalid."
+    ]
+
+    # And the loser left no account behind.
+    assert (
+        sum(
+            db_user_handler.get_user_by_username(f"test_racer_{i}") is not None
+            for i in range(2)
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    "base_url, expected_url",
+    [
+        ("https://romm.example.com/", "https://romm.example.com/register?token="),
+        ("http://0.0.0.0", None),
+        ("http://localhost:3000", None),
+        ("http://127.0.0.2:8080", None),
+        ("http://[::1]:8080", None),
+        ("romm.example.com", None),
+        ("ftp://romm.example.com", None),
+    ],
+)
+def test_create_invite_link_url(
+    client, access_token: str, base_url: str, expected_url: str | None
+):
+    with mock.patch("config.ROMM_BASE_URL", base_url):
+        response = client.post(
+            "/api/users/invite-link",
+            params={"role": Role.USER.value},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+
+    assert response.status_code == HTTPStatus.CREATED
+    invite = response.json()
+    if expected_url is None:
+        assert invite["url"] is None
+    else:
+        assert invite["url"] == f"{expected_url}{invite['token']}"
+
+
+def test_delete_user(client, access_token: str, editor_user: User):
+    response = client.delete(
+        f"/api/users/{editor_user.id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == HTTPStatus.OK
+
+
+def test_delete_user_closes_their_device_sockets(
+    mocker, client, access_token: str, editor_user: User, add_device_token
+):
+    token, _ = add_device_token(editor_user, None, scopes="devices.read")
+    close = mocker.patch.object(
+        user_endpoints, "close_client_token_sockets", mock.AsyncMock()
+    )
+
+    response = client.delete(
+        f"/api/users/{editor_user.id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    assert response.status_code == HTTPStatus.OK
+    close.assert_awaited_once_with([token.id])
+
+
+def test_delete_user_drops_their_install_requests(
+    client, access_token: str, editor_user: User
+):
+    db_device_handler.add_device(
+        Device(id="deleted-user-device", user_id=editor_user.id, name="Handheld")
+    )
+    install, _ = asyncio.run(
+        device_install_handler.create(
+            user_id=editor_user.id,
+            device_id="deleted-user-device",
+            rom_id=7,
+            file_ids=[1],
+        )
+    )
+
+    response = client.delete(
+        f"/api/users/{editor_user.id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    assert response.status_code == HTTPStatus.OK
+    assert asyncio.run(device_install_handler.get(install.id)) is None
+
+
+def test_disabling_a_user_closes_their_device_sockets(
+    mocker, client, access_token: str, editor_user: User, add_device_token
+):
+    token, _ = add_device_token(editor_user, None, scopes="devices.read")
+    close = mocker.patch.object(
+        user_endpoints, "close_client_token_sockets", mock.AsyncMock()
+    )
+
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        data={"enabled": "false"},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    assert response.status_code == HTTPStatus.OK
+    close.assert_awaited_once_with([token.id])
+
+
+def test_changing_a_users_role_closes_their_device_sockets(
+    mocker, client, access_token: str, editor_user: User, add_device_token
+):
+    token, _ = add_device_token(editor_user, None, scopes="devices.read")
+    close = mocker.patch.object(
+        permissions_endpoints, "close_client_token_sockets", mock.AsyncMock()
+    )
+
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        data={"role": "admin"},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    assert response.status_code == HTTPStatus.OK
+    close.assert_awaited_once_with([token.id])
+
+
+@pytest.mark.parametrize("form", [{"ra_username": "someone"}, {"enabled": "true"}])
+def test_other_user_edits_leave_their_device_sockets_open(
+    mocker, client, access_token: str, editor_user: User, form, add_device_token
+):
+    add_device_token(editor_user, None, scopes="devices.read")
+    close = mocker.patch.object(
+        user_endpoints, "close_client_token_sockets", mock.AsyncMock()
+    )
+
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        data=form,
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    assert response.status_code == HTTPStatus.OK
+    close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_admin_password_reset_invalidates_the_target_user_sessions(
+    client, access_token: str, editor_user: User
+):
+    """The reason the revocation is not scoped to the caller: an admin resetting
+    a compromised account has to end that account's sessions, not their own."""
+    basic_auth = base64.b64encode(
+        f"{editor_user.username}:test_editor_password".encode("ascii")
+    ).decode("ascii")
+    response = client.post(
+        "/api/login", headers={"Authorization": f"Basic {basic_auth}"}
+    )
+    assert response.status_code == HTTPStatus.OK
+    target_session = response.cookies.get("romm_session")
+    assert target_session is not None
+
+    target_cookie = {"Cookie": f"romm_session={target_session}"}
+    assert client.get("/api/users/me", headers=target_cookie).status_code == (
+        HTTPStatus.OK
+    )
+
+    client.cookies.clear()
+
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        data={"password": "reset_by_admin_password"},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == HTTPStatus.OK
+
+    response = client.get("/api/users/me", headers=target_cookie)
+    assert response.status_code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN)
+
+    # The admin's own credentials still work.
+    response = client.get(
+        "/api/users", headers={"Authorization": f"Bearer {access_token}"}
+    )
+    assert response.status_code == HTTPStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_a_failed_revocation_leaves_the_password_unchanged(
+    client, access_token: str, editor_user: User
+):
+    """An unreachable Redis aborts the change instead of committing it."""
+    original_hash = editor_user.hashed_password
+
+    with mock.patch.object(
+        RedisSessionMiddleware,
+        "clear_user_sessions",
+        side_effect=ConnectionError("redis is down"),
+    ):
+        with pytest.raises(ConnectionError):
+            client.put(
+                f"/api/users/{editor_user.id}",
+                data={"password": "reset_while_redis_is_down"},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+
+    db_user = DBUsersHandler().get_user(editor_user.id)
+    assert db_user is not None
+    assert db_user.hashed_password == original_hash
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_write_revocation_does_not_fail_the_change(
+    client, access_token: str, editor_user: User
+):
+    """The write has committed by the second pass, so its failure is logged."""
+    original_hash = editor_user.hashed_password
+    calls: list[str] = []
+
+    async def revoke_then_fail(user_id: str) -> None:
+        calls.append(user_id)
+        if len(calls) == 2:
+            raise ConnectionError("redis went down mid-update")
+
+    with mock.patch.object(
+        RedisSessionMiddleware, "clear_user_sessions", side_effect=revoke_then_fail
+    ):
+        response = client.put(
+            f"/api/users/{editor_user.id}",
+            data={"password": "reset_with_redis_failing_late"},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+
+    assert response.status_code == HTTPStatus.OK
+    assert len(calls) == 2
+
+    db_user = DBUsersHandler().get_user(editor_user.id)
+    assert db_user is not None
+    assert db_user.hashed_password != original_hash
+
+
+@pytest.mark.asyncio
+async def test_sessions_are_revoked_on_both_sides_of_the_write(
+    client, access_token: str, editor_user: User
+):
+    """The second pass catches a login the old password was still good for."""
+    calls: list[str] = []
+    real_update = DBUsersHandler.update_user
+
+    def record_update(
+        self: DBUsersHandler, id: int, data: dict[str, Any], *args: Any, **kwargs: Any
+    ) -> User:
+        # `set_last_active` writes on every authenticated request; only the
+        # credential write is being ordered here.
+        if "hashed_password" in data:
+            calls.append("write")
+        return real_update(self, id, data, *args, **kwargs)
+
+    async def record_revoke(user_id: str) -> None:
+        calls.append("revoke")
+
+    with (
+        mock.patch.object(DBUsersHandler, "update_user", record_update),
+        mock.patch.object(
+            RedisSessionMiddleware, "clear_user_sessions", side_effect=record_revoke
+        ),
+    ):
+        response = client.put(
+            f"/api/users/{editor_user.id}",
+            data={"password": "another_reset_password"},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+
+    assert response.status_code == HTTPStatus.OK
+    assert calls == ["revoke", "write", "revoke"]
+
+
+@pytest.mark.asyncio
+async def test_password_change_invalidates_sessions(client, admin_user: User):
+    # Get the user's session cookie
+    basic_auth = base64.b64encode(
+        f"{admin_user.username}:test_admin_password".encode("ascii")
+    ).decode("ascii")
+    response = client.post(
+        "/api/login", headers={"Authorization": f"Basic {basic_auth}"}
+    )
+    assert response.status_code == HTTPStatus.OK
+    old_session_cookie = response.cookies.get("romm_session")
+    assert old_session_cookie is not None
+
+    def _cookie_header(cookie_value: str) -> dict[str, str]:
+        return {"Cookie": f"romm_session={cookie_value}"}
+
+    # Verify session works
+    response = client.get("/api/users/me", headers=_cookie_header(old_session_cookie))
+    assert response.status_code == HTTPStatus.OK
+
+    # Update the user's password
+    response = client.put(
+        f"/api/users/{admin_user.id}",
+        data={"password": "new_admin_password"},
+        headers={"Authorization": f"Basic {basic_auth}"},
+    )
+    assert response.status_code == HTTPStatus.OK
+
+    # Attempt to access a protected resource using the old session cookie
+    response = client.get("/api/users/me", headers=_cookie_header(old_session_cookie))
+    assert response.status_code in [HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN]
+
+    # Login with the new credentials
+    basic_auth_new = base64.b64encode(
+        f"{admin_user.username}:new_admin_password".encode("ascii")
+    ).decode("ascii")
+    response = client.post(
+        "/api/login", headers={"Authorization": f"Basic {basic_auth_new}"}
+    )
+    assert response.status_code == HTTPStatus.OK
+    new_session_cookie = response.cookies.get("romm_session")
+    assert new_session_cookie is not None
+    assert new_session_cookie != old_session_cookie
+
+    # Attempt to access a protected resource using the new session cookie
+    response = client.get("/api/users/me", headers=_cookie_header(new_session_cookie))
+    assert response.status_code == HTTPStatus.OK
+
+    await RedisSessionMiddleware.clear_user_sessions(admin_user.username)
+
+
+@pytest.mark.asyncio
+async def test_logout_invalidates_session(client, admin_user: User):
+    # Get the user's session cookie
+    basic_auth = base64.b64encode(
+        f"{admin_user.username}:test_admin_password".encode("ascii")
+    ).decode("ascii")
+    response = client.post(
+        "/api/login", headers={"Authorization": f"Basic {basic_auth}"}
+    )
+    assert response.status_code == HTTPStatus.OK
+    session_cookie = response.cookies.get("romm_session")
+    assert session_cookie is not None
+
+    def _cookie_header(cookie_value: str) -> dict[str, str]:
+        return {"Cookie": f"romm_session={cookie_value}"}
+
+    # Verify session works
+    response = client.get("/api/users/me", headers=_cookie_header(session_cookie))
+    assert response.status_code == HTTPStatus.OK
+
+    # Log out the user
+    response = client.post("/api/logout", headers=_cookie_header(session_cookie))
+    assert response.status_code == HTTPStatus.OK
+
+    # Attempt to access a protected resource using the old session cookie
+    response = client.get("/api/users/me", headers=_cookie_header(session_cookie))
+    assert response.status_code in [HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN]
+
+    await RedisSessionMiddleware.clear_user_sessions(admin_user.username)
+
+
+def test_logout_without_oidc_returns_no_body(client, admin_user: User):
+    """Test that logout without OIDC session returns no OIDC logout URL."""
+    basic_auth = base64.b64encode(b"test_admin:test_admin_password").decode("ascii")
+    response = client.post(
+        "/api/login", headers={"Authorization": f"Basic {basic_auth}"}
+    )
+    assert response.status_code == HTTPStatus.OK
+
+    response = client.post("/api/logout")
+    assert response.status_code == HTTPStatus.OK
+    # Non-OIDC session should not return an oidc_logout_url
+    assert response.json() is None
+
+
+@pytest.mark.asyncio
+async def test_logout_with_oidc_rp_initiated_logout(client, admin_user: User):
+    """Test that logout with OIDC RP-Initiated Logout returns the end-session URL."""
+    basic_auth = base64.b64encode(b"test_admin:test_admin_password").decode("ascii")
+    response = client.post(
+        "/api/login", headers={"Authorization": f"Basic {basic_auth}"}
+    )
+    assert response.status_code == HTTPStatus.OK
+    session_cookie = response.cookies.get("romm_session")
+    assert session_cookie is not None
+
+    end_session_url = "https://auth.example.com/application/o/romm/end-session/"
+    fake_id_token = "fake.id.token"
+
+    # The session middleware uses async_cache (not sync_cache), so we must use
+    # async_cache to inject oidc_id_token into the session data in Redis.
+    session_data_raw = await async_cache.get(f"session:{session_cookie}")
+    assert session_data_raw is not None
+    session_dict = json.loads(session_data_raw)
+    session_dict["oidc_id_token"] = fake_id_token
+    await async_cache.set(f"session:{session_cookie}", json.dumps(session_dict))
+
+    with (
+        mock.patch("endpoints.auth.OIDC_RP_INITIATED_LOGOUT", True),
+        mock.patch("endpoints.auth.OIDC_END_SESSION_ENDPOINT", end_session_url),
+    ):
+        response = client.post(
+            "/api/logout",
+            headers={"Cookie": f"romm_session={session_cookie}"},
+        )
+        assert response.status_code == HTTPStatus.OK
+        data = response.json()
+        assert data is not None
+        assert "oidc_logout_url" in data
+        assert data["oidc_logout_url"].startswith(end_session_url)
+        assert f"id_token_hint={fake_id_token}" in data["oidc_logout_url"]
+
+
+def _rejected_oidc_callback(
+    client: TestClient,
+    error: Exception | None = None,
+    headers: dict[str, str] | None = None,
+) -> httpx2.Response:
+    fake_oauth = mock.MagicMock()
+    fake_oauth.openid.authorize_access_token = mock.AsyncMock(
+        side_effect=error or MismatchingStateError()
+    )
+    with (
+        mock.patch("endpoints.auth.OIDC_ENABLED", True),
+        mock.patch("endpoints.auth.oauth", fake_oauth),
+    ):
+        return client.get(
+            "/api/oauth/openid?code=new&state=spent",
+            headers=headers,
+            follow_redirects=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        MismatchingStateError(),
+        OAuthError(error="access_denied"),
+        InvalidClaimError("nonce"),
+    ],
+    ids=["spent_state", "provider_error", "invalid_id_token"],
+)
+def test_oidc_callback_rejected_redirects_to_login(
+    client: TestClient, error: Exception
+):
+    response = _rejected_oidc_callback(client, error)
+
+    assert response.status_code == HTTPStatus.TEMPORARY_REDIRECT
+    assert response.headers["location"] == "/login?bypass_autologin=true"
+
+
+def test_oidc_callback_rejected_in_kiosk_mode_redirects_to_login(
+    client: TestClient,
+):
+    with mock.patch("handler.auth.hybrid_auth.KIOSK_MODE", True):
+        response = _rejected_oidc_callback(client)
+
+    assert response.status_code == HTTPStatus.TEMPORARY_REDIRECT
+    assert response.headers["location"] == "/login?bypass_autologin=true"
+
+
+def test_oidc_callback_with_spent_state_keeps_existing_session(
+    client: TestClient, admin_user: User
+):
+    basic_auth = base64.b64encode(b"test_admin:test_admin_password").decode("ascii")
+    response = client.post(
+        "/api/login", headers={"Authorization": f"Basic {basic_auth}"}
+    )
+    session_cookie = response.cookies.get(SESSION_COOKIE_NAME)
+    assert session_cookie is not None
+    cookie_header = {"Cookie": f"{SESSION_COOKIE_NAME}={session_cookie}"}
+
+    response = _rejected_oidc_callback(client, headers=cookie_header)
+
+    assert response.status_code == HTTPStatus.TEMPORARY_REDIRECT
+    assert response.headers["location"] == "/"
+    assert client.get("/api/users/me", headers=cookie_header).status_code == (
+        status.HTTP_200_OK
+    )
+
+
+def test_update_user_with_valid_ui_settings(
+    client, access_token: str, editor_user: User
+):
+    """Test updating a user with valid ui_settings JSON object."""
+    valid_ui_settings = {
+        "theme": "dark",
+        "language": "en",
+        "notifications_enabled": True,
+        "items_per_page": 50,
+    }
+
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        data={"ui_settings": json.dumps(valid_ui_settings)},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == HTTPStatus.OK
+
+    user = response.json()
+    assert user["ui_settings"] == valid_ui_settings
+
+    # Verify settings are properly stored by retrieving the user again
+    response = client.get(
+        f"/api/users/{editor_user.id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == HTTPStatus.OK
+    user = response.json()
+    assert user["ui_settings"] == valid_ui_settings
+
+
+def test_update_user_with_invalid_ui_settings_json(
+    client, access_token: str, editor_user: User
+):
+    """Test that updating ui_settings with invalid JSON returns 400."""
+    invalid_json = '{"theme": "dark", "language": "en"'  # Missing closing brace
+
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        data={"ui_settings": invalid_json},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert "Invalid ui_settings JSON" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "non_object_value",
+    [
+        '["array", "value"]',  # Array
+        '"string_value"',  # String
+        "123",  # Number
+        "true",  # Boolean
+        "null",  # Null
+    ],
+)
+def test_update_user_with_non_object_ui_settings(
+    client, access_token: str, editor_user: User, non_object_value: str
+):
+    """Test that updating ui_settings with non-object JSON returns 400."""
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        data={"ui_settings": non_object_value},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert "Invalid ui_settings JSON" in response.json()["detail"]
+
+
+def test_update_user_ui_settings_empty_object(
+    client, access_token: str, editor_user: User
+):
+    """Test that updating ui_settings with an empty object is valid."""
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        data={"ui_settings": "{}"},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == HTTPStatus.OK
+
+    user = response.json()
+    assert user["ui_settings"] == {}
+
+
+def test_update_user_ui_settings_nested_object(
+    client, access_token: str, editor_user: User
+):
+    """Test that nested objects in ui_settings are properly handled."""
+    nested_settings = {
+        "theme": {"mode": "dark", "accent": "blue"},
+        "layout": {"sidebar": {"collapsed": False, "width": 250}},
+        "preferences": {"autoSave": True, "confirmDelete": True},
+    }
+
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        data={"ui_settings": json.dumps(nested_settings)},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == HTTPStatus.OK
+
+    user = response.json()
+    assert user["ui_settings"] == nested_settings

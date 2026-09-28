@@ -1,0 +1,109 @@
+from typing import TypedDict
+
+from .platform import PlatformSchema
+
+
+class SystemDict(TypedDict):
+    VERSION: str
+    GIT_BRANCH: str | None
+    SHOW_SETUP_WIZARD: bool
+
+
+class MetadataSourcesDict(TypedDict):
+    ANY_SOURCE_ENABLED: bool
+    IGDB_API_ENABLED: bool
+    SS_API_ENABLED: bool
+    SS_DEV_CREDENTIALS_SET: bool
+    MOBY_API_ENABLED: bool
+    STEAMGRIDDB_API_ENABLED: bool
+    RA_API_ENABLED: bool
+    LAUNCHBOX_API_ENABLED: bool
+    HASHEOUS_API_ENABLED: bool
+    PLAYMATCH_API_ENABLED: bool
+    TGDB_API_ENABLED: bool
+    FLASHPOINT_API_ENABLED: bool
+    HLTB_API_ENABLED: bool
+    DEMOZOO_API_ENABLED: bool
+    POUET_API_ENABLED: bool
+    CSDB_API_ENABLED: bool
+    STEAM_API_ENABLED: bool
+    LIBRETRO_API_ENABLED: bool
+
+
+class FilesystemDict(TypedDict):
+    FS_PLATFORMS: list[str]
+    TITLE_ID_EXTRACTION_ENABLED: bool
+
+
+class EmulationDict(TypedDict):
+    DISABLE_EMULATOR_JS: bool
+    DISABLE_RUFFLE_RS: bool
+    DISABLE_JSDOS: bool
+    DISABLE_PICO8: bool
+
+
+class FrontendDict(TypedDict):
+    DISABLE_USERPASS_LOGIN: bool
+    DISABLE_LOGS_VIEWER: bool
+    YOUTUBE_BASE_URL: str
+
+
+class OIDCDict(TypedDict):
+    ENABLED: bool
+    AUTOLOGIN: bool
+    PROVIDER: str
+    RP_INITIATED_LOGOUT: bool
+
+
+class NotificationsDict(TypedDict):
+    EMAIL_ENABLED: bool
+    # Email is set up and ROMM_BASE_URL is shareable, so reset links are mailed.
+    EMAILS_RESET_LINKS: bool
+
+
+class DeviceInstallDict(TypedDict):
+    ENABLED: bool
+    EXCLUDED_PLATFORM_SLUGS: list[str]
+
+
+class TasksDict(TypedDict):
+    ENABLE_SCHEDULED_RESCAN: bool
+    SCHEDULED_RESCAN_CRON: str
+    ENABLE_SCHEDULED_UPDATE_SWITCH_TITLEDB: bool
+    SCHEDULED_UPDATE_SWITCH_TITLEDB_CRON: str
+    ENABLE_SCHEDULED_UPDATE_LAUNCHBOX_METADATA: bool
+    SCHEDULED_UPDATE_LAUNCHBOX_METADATA_CRON: str
+    ENABLE_SCHEDULED_CONVERT_IMAGES_TO_WEBP: bool
+    SCHEDULED_CONVERT_IMAGES_TO_WEBP_CRON: str
+
+
+class HeartbeatResponse(TypedDict):
+    SYSTEM: SystemDict
+    METADATA_SOURCES: MetadataSourcesDict
+    FILESYSTEM: FilesystemDict
+    EMULATION: EmulationDict
+    FRONTEND: FrontendDict
+    OIDC: OIDCDict
+    NOTIFICATIONS: NotificationsDict
+    DEVICE_INSTALL: DeviceInstallDict
+    TASKS: TasksDict
+
+
+class SetupExistingPlatform(TypedDict):
+    fs_slug: str
+    rom_count: int
+
+
+class SetupLibraryResponse(TypedDict):
+    # Whether the configured platforms folder exists on disk.
+    library_ready: bool
+    # The configured `filesystem.structure.default` template.
+    library_structure: str
+    existing_platforms: list[SetupExistingPlatform]
+    supported_platforms: list[PlatformSchema]
+
+
+class SetupPlatformsResponse(TypedDict):
+    success: bool
+    created_count: int
+    message: str

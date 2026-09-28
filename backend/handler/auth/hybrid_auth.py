@@ -1,0 +1,137 @@
+from datetime import datetime, timezone
+from typing import NamedTuple
+
+from fastapi import HTTPException
+from fastapi.security.http import HTTPBasic
+from starlette.authentication import AuthCredentials, AuthenticationBackend
+from starlette.requests import HTTPConnection
+
+from config import KIOSK_MODE
+from handler.auth import auth_handler, oauth_handler
+from handler.database import (
+    db_client_token_handler,
+    db_device_handler,
+    db_user_handler,
+)
+from models.client_token import ClientToken
+from models.user import User
+from utils.datetime import to_utc
+
+from .constants import CLIENT_TOKEN_PREFIX, READ_SCOPES
+
+
+class ClientTokenIdentity(NamedTuple):
+    token: ClientToken
+    user: User
+    scopes: list[str]
+
+
+def resolve_client_token(raw_token: str) -> ClientTokenIdentity | None:
+    """The live client token behind a raw one, its enabled owner, and the scopes both hold."""
+    client_token = db_client_token_handler.get_token_by_hash(
+        auth_handler.hash_client_token(raw_token)
+    )
+    if client_token is None:
+        return None
+
+    if client_token.expires_at and to_utc(client_token.expires_at) < datetime.now(
+        timezone.utc
+    ):
+        return None
+
+    user = db_user_handler.get_user(client_token.user_id)
+    if user is None or not user.enabled:
+        return None
+
+    token_scopes = set(client_token.scopes.split())
+    return ClientTokenIdentity(
+        client_token, user, list(token_scopes & set(user.oauth_scopes))
+    )
+
+
+class HybridAuthBackend(AuthenticationBackend):
+    async def authenticate(
+        self, conn: HTTPConnection
+    ) -> tuple[AuthCredentials, User] | None:
+        # Check if session key already stored in cache
+        user = await auth_handler.get_current_active_user_from_session(conn)
+        if user:
+            user.set_last_active()
+            return (AuthCredentials(user.oauth_scopes), user)
+
+        # Errors raised here bypass FastAPI's exception handlers and surface as 500s,
+        # so an unusable credential leaves the request unauthenticated instead
+        if "Authorization" in conn.headers:
+            auth_header_parts = conn.headers["Authorization"].split()
+            if len(auth_header_parts) != 2:
+                return None
+
+            scheme, token = auth_header_parts
+
+            # Check if basic auth header is valid
+            if scheme.lower() == "basic":
+                try:
+                    credentials = await HTTPBasic().__call__(conn)  # type: ignore[arg-type]
+                except HTTPException:
+                    return None
+                if not credentials:
+                    return None
+
+                user = auth_handler.authenticate_user(
+                    credentials.username, credentials.password
+                )
+                if user is None or not user.enabled:
+                    return None
+
+                user.set_last_active()
+                return (AuthCredentials(user.oauth_scopes), user)
+
+            # Check if bearer auth header is valid
+            if scheme.lower() == "bearer":
+                if token.startswith(CLIENT_TOKEN_PREFIX):
+                    identity = resolve_client_token(token)
+                    if identity is None:
+                        return None
+
+                    client_token, user, effective_scopes = identity
+                    db_client_token_handler.update_last_used(client_token.id)
+                    user.set_last_active()
+                    conn.state.client_token_id = client_token.id
+                    conn.state.device_id = client_token.device_id
+                    if client_token.device_id:
+                        db_device_handler.update_last_seen_debounced(
+                            client_token.device_id
+                        )
+                    return (AuthCredentials(effective_scopes), user)
+
+                # OAuth JWT bearer tokens
+                try:
+                    (
+                        user,
+                        claims,
+                    ) = await oauth_handler.get_current_active_user_from_bearer_token(
+                        token
+                    )
+                except HTTPException:
+                    return None
+
+                if user is None or claims is None:
+                    return None
+
+                # Only access tokens can request resources
+                if claims.get("type") != "access":
+                    return None
+
+                # Only grant access to resources with overlapping scopes
+                token_scopes = set(list(claims.get("scopes", "").split(" ")))
+                overlapping_scopes = list(token_scopes & set(user.oauth_scopes))
+
+                user.set_last_active()
+                return (AuthCredentials(overlapping_scopes), user)
+
+        # Check if we're in KIOSK_MODE
+        if KIOSK_MODE:
+            user = User.kiosk_mode_user()
+            return (AuthCredentials(READ_SCOPES), user)
+
+        return None

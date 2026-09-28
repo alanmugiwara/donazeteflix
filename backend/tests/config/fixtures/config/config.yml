@@ -1,0 +1,97 @@
+# Example config file used only for testing
+# Refer to examples/config.example.yml for a more detailed config file
+
+exclude:
+  platforms:
+    - "romm"
+  roms:
+    single_file:
+      names:
+        - "info.txt"
+      extensions:
+        - "xml"
+
+    multi_file:
+      names:
+        - "my_multi_file_game"
+        - "DLC"
+      parts:
+        names:
+          - "data.xml"
+        extensions:
+          - "txt"
+system:
+  platforms:
+    gc: "ngc"
+  versions:
+    naomi: "arcade"
+
+filesystem:
+  skip_hash_calculation: true
+  structure:
+    default: "ROMS/{platform}/{game}"
+    firmware: "BIOS/{platform}"
+    psx: "ROMS/{platform}/{category}/{game}"
+    nes:
+      - "ROMS/{platform}/{game}"
+      - "ROMS/{platform}/{category}/{game}"
+
+scan:
+  priority:
+    metadata:
+      - "ss" # Screenscraper
+      - "launchbox" # Launchbox
+    artwork:
+      - "igdb" # IGDB
+      - "ss" # Screenscraper
+    cover:
+      - "ss"
+      - "tgdb"
+    screenshot:
+      - "igdb"
+    region:
+      - jp
+      - eu
+      - wor
+    region_mode: prefer_config
+    language:
+      - jp
+      - es
+  media:
+    - box2d
+    - box3d
+    - physical
+    - miximage
+  gamelist:
+    export: true
+    media:
+      thumbnail: "box3d"
+      image: "title_screen"
+
+emulatorjs:
+  debug: true
+  cache_limit: 1000
+  disable_auto_unload: true
+  disable_batch_bootup: true
+  auto_save_sync: false
+  netplay:
+    enabled: true
+    ice_servers:
+      - urls: "stun:stun.relay.metered.ca:80"
+      - urls: "turn:global.relay.metered.ca:80"
+        username: "user"
+        credential: "password"
+  default_cores:
+    nds: desmume
+    Nintendo-DSi: melonds
+  settings:
+    parallel_n64:
+      vsync: disabled
+    snes9x:
+      snes9x_region: ntsc
+  controls:
+    snes9x:
+      0:
+        0:
+          value: x
+          value2: BUTTON_2

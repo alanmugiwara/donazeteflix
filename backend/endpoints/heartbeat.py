@@ -1,0 +1,443 @@
+import asyncio
+import os
+from collections import defaultdict
+from typing import Final
+
+from anyio import Path as AnyioPath
+from fastapi import HTTPException, Request, status
+
+from adapters.services.sigil import SigilService
+from config import (
+    DEVICE_INSTALL_ENABLED,
+    DEVICE_INSTALL_EXCLUDED_PLATFORM_SLUGS,
+    DISABLE_EMULATOR_JS,
+    DISABLE_JSDOS,
+    DISABLE_LOGS_VIEWER,
+    DISABLE_PICO8,
+    DISABLE_RUFFLE_RS,
+    DISABLE_SETUP_WIZARD,
+    DISABLE_USERPASS_LOGIN,
+    EMAIL_ENABLED,
+    ENABLE_SCHEDULED_CONVERT_IMAGES_TO_WEBP,
+    ENABLE_SCHEDULED_RESCAN,
+    ENABLE_SCHEDULED_UPDATE_LAUNCHBOX_METADATA,
+    ENABLE_SCHEDULED_UPDATE_SWITCH_TITLEDB,
+    LIBRARY_BASE_PATH,
+    OIDC_AUTOLOGIN,
+    OIDC_ENABLED,
+    OIDC_PROVIDER,
+    OIDC_RP_INITIATED_LOGOUT,
+    SCHEDULED_CONVERT_IMAGES_TO_WEBP_CRON,
+    SCHEDULED_RESCAN_CRON,
+    SCHEDULED_UPDATE_LAUNCHBOX_METADATA_CRON,
+    SCHEDULED_UPDATE_SWITCH_TITLEDB_CRON,
+    YOUTUBE_BASE_URL,
+)
+from config.config_manager import config_manager as cm
+from decorators.auth import protected_route
+from endpoints.responses.heartbeat import (
+    HeartbeatResponse,
+    SetupExistingPlatform,
+    SetupLibraryResponse,
+    SetupPlatformsResponse,
+)
+from exceptions.fs_exceptions import PlatformAlreadyExistsException
+from handler.auth.base_handler import reset_link_base_url
+from handler.auth.constants import Scope
+from handler.database import db_stats_handler, db_user_handler
+from handler.filesystem import fs_platform_handler
+from handler.metadata import (
+    meta_csdb_handler,
+    meta_demozoo_handler,
+    meta_flashpoint_handler,
+    meta_gamelist_handler,
+    meta_hasheous_handler,
+    meta_hltb_handler,
+    meta_igdb_handler,
+    meta_launchbox_handler,
+    meta_libretro_handler,
+    meta_moby_handler,
+    meta_playmatch_handler,
+    meta_pouet_handler,
+    meta_ra_handler,
+    meta_sgdb_handler,
+    meta_ss_handler,
+    meta_steam_handler,
+    meta_tgdb_handler,
+)
+from handler.redis_handler import sync_cache
+from handler.scan_handler import MetadataSource
+from logger.logger import log
+from utils import get_git_branch, get_version
+from utils.platforms import get_supported_platforms
+from utils.rate_limit import enforce_rate_limit, get_client_ip
+from utils.router import APIRouter
+
+# The endpoint is unauthenticated, and every probe passes through the provider's
+# process-global outbound limiter, where it competes with scans.
+METADATA_HEARTBEAT_RATE_LIMIT: Final[int] = 20
+METADATA_HEARTBEAT_RATE_LIMIT_WINDOW_SECONDS: Final[int] = 60
+
+# Holds outbound probes to one per source per window whatever the inbound rate, which
+# the per-IP cap cannot do against a spoofed forwarded header or a distributed flood.
+METADATA_HEARTBEAT_CACHE_TTL_SECONDS: Final[int] = 60
+
+# The key set is the MetadataSource enum, so this cannot grow past a lock per source.
+_probe_locks: defaultdict[MetadataSource, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+router = APIRouter(
+    tags=["system"],
+)
+
+
+@router.get("/heartbeat")
+async def heartbeat() -> HeartbeatResponse:
+    """Endpoint to set the CSRF token in cache and return all the basic RomM config
+
+    Returns:
+        HeartbeatReturn: TypedDict structure with all the defined values in the HeartbeatReturn class.
+    """
+    title_id_extraction_enabled = (
+        SigilService.is_enabled() and not cm.get_config().SKIP_TITLE_ID_EXTRACTION
+    )
+
+    igdb_enabled = meta_igdb_handler.is_enabled()
+    flashpoint_enabled = meta_flashpoint_handler.is_enabled()
+    ss_enabled = meta_ss_handler.is_enabled()
+    moby_enabled = meta_moby_handler.is_enabled()
+    ra_enabled = meta_ra_handler.is_enabled()
+    sgdb_enabled = meta_sgdb_handler.is_enabled()
+    launchbox_enabled = meta_launchbox_handler.is_enabled()
+    hasheous_enabled = meta_hasheous_handler.is_enabled()
+    playmatch_enabled = meta_playmatch_handler.is_enabled()
+    hltb_enabled = meta_hltb_handler.is_enabled()
+    demozoo_enabled = meta_demozoo_handler.is_enabled()
+    pouet_enabled = meta_pouet_handler.is_enabled()
+    csdb_enabled = meta_csdb_handler.is_enabled()
+    steam_enabled = meta_steam_handler.is_enabled()
+    tgdb_enabled = meta_tgdb_handler.is_enabled()
+    libretro_enabled = meta_libretro_handler.is_enabled()
+
+    version = get_version()
+    return {
+        "SYSTEM": {
+            "VERSION": version,
+            "GIT_BRANCH": get_git_branch() if version == "development" else None,
+            "SHOW_SETUP_WIZARD": len(db_user_handler.get_admin_users()) == 0
+            and not DISABLE_SETUP_WIZARD,
+        },
+        "METADATA_SOURCES": {
+            "ANY_SOURCE_ENABLED": (
+                igdb_enabled
+                or ss_enabled
+                or moby_enabled
+                or ra_enabled
+                or launchbox_enabled
+                or hasheous_enabled
+                or tgdb_enabled
+                or flashpoint_enabled
+                or hltb_enabled
+                or demozoo_enabled
+                or pouet_enabled
+                or csdb_enabled
+                or steam_enabled
+                or libretro_enabled
+            ),
+            "IGDB_API_ENABLED": igdb_enabled,
+            "SS_API_ENABLED": ss_enabled,
+            "SS_DEV_CREDENTIALS_SET": meta_ss_handler.has_dev_credentials(),
+            "MOBY_API_ENABLED": moby_enabled,
+            "STEAMGRIDDB_API_ENABLED": sgdb_enabled,
+            "RA_API_ENABLED": ra_enabled,
+            "LAUNCHBOX_API_ENABLED": launchbox_enabled,
+            "HASHEOUS_API_ENABLED": hasheous_enabled,
+            "PLAYMATCH_API_ENABLED": playmatch_enabled,
+            "TGDB_API_ENABLED": tgdb_enabled,
+            "FLASHPOINT_API_ENABLED": flashpoint_enabled,
+            "HLTB_API_ENABLED": hltb_enabled,
+            "DEMOZOO_API_ENABLED": demozoo_enabled,
+            "POUET_API_ENABLED": pouet_enabled,
+            "CSDB_API_ENABLED": csdb_enabled,
+            "STEAM_API_ENABLED": steam_enabled,
+            "LIBRETRO_API_ENABLED": libretro_enabled,
+        },
+        "FILESYSTEM": {
+            "FS_PLATFORMS": await fs_platform_handler.get_platforms(),
+            "TITLE_ID_EXTRACTION_ENABLED": title_id_extraction_enabled,
+        },
+        "EMULATION": {
+            "DISABLE_EMULATOR_JS": DISABLE_EMULATOR_JS,
+            "DISABLE_RUFFLE_RS": DISABLE_RUFFLE_RS,
+            "DISABLE_JSDOS": DISABLE_JSDOS,
+            "DISABLE_PICO8": DISABLE_PICO8,
+        },
+        "FRONTEND": {
+            "DISABLE_USERPASS_LOGIN": DISABLE_USERPASS_LOGIN,
+            "DISABLE_LOGS_VIEWER": DISABLE_LOGS_VIEWER,
+            "YOUTUBE_BASE_URL": YOUTUBE_BASE_URL,
+        },
+        "OIDC": {
+            "ENABLED": OIDC_ENABLED,
+            "AUTOLOGIN": OIDC_AUTOLOGIN,
+            "PROVIDER": OIDC_PROVIDER,
+            "RP_INITIATED_LOGOUT": OIDC_RP_INITIATED_LOGOUT,
+        },
+        "NOTIFICATIONS": {
+            "EMAIL_ENABLED": EMAIL_ENABLED,
+            "EMAILS_RESET_LINKS": reset_link_base_url() is not None,
+        },
+        "DEVICE_INSTALL": {
+            "ENABLED": DEVICE_INSTALL_ENABLED,
+            "EXCLUDED_PLATFORM_SLUGS": sorted(DEVICE_INSTALL_EXCLUDED_PLATFORM_SLUGS),
+        },
+        "TASKS": {
+            "ENABLE_SCHEDULED_RESCAN": ENABLE_SCHEDULED_RESCAN,
+            "SCHEDULED_RESCAN_CRON": SCHEDULED_RESCAN_CRON,
+            "ENABLE_SCHEDULED_UPDATE_SWITCH_TITLEDB": ENABLE_SCHEDULED_UPDATE_SWITCH_TITLEDB,
+            "SCHEDULED_UPDATE_SWITCH_TITLEDB_CRON": SCHEDULED_UPDATE_SWITCH_TITLEDB_CRON,
+            "ENABLE_SCHEDULED_UPDATE_LAUNCHBOX_METADATA": ENABLE_SCHEDULED_UPDATE_LAUNCHBOX_METADATA,
+            "SCHEDULED_UPDATE_LAUNCHBOX_METADATA_CRON": SCHEDULED_UPDATE_LAUNCHBOX_METADATA_CRON,
+            "ENABLE_SCHEDULED_CONVERT_IMAGES_TO_WEBP": ENABLE_SCHEDULED_CONVERT_IMAGES_TO_WEBP,
+            "SCHEDULED_CONVERT_IMAGES_TO_WEBP_CRON": SCHEDULED_CONVERT_IMAGES_TO_WEBP_CRON,
+        },
+    }
+
+
+@router.get("/heartbeat/metadata/{source}")
+async def metadata_heartbeat(request: Request, source: str) -> bool:
+    """Endpoint to return the heartbeat of the metadata sources"""
+    try:
+        metadata_source = MetadataSource(source)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid metadata source") from e
+
+    # Keyed on the parsed source, so arbitrary path values can't grow the keyspace.
+    enforce_rate_limit(
+        f"metadata-heartbeat-rate:{get_client_ip(request)}:{metadata_source.value}",
+        max_requests=METADATA_HEARTBEAT_RATE_LIMIT,
+        window_seconds=METADATA_HEARTBEAT_RATE_LIMIT_WINDOW_SECONDS,
+        detail="Too many metadata heartbeat requests. Try again later.",
+    )
+
+    cache_key = f"metadata-heartbeat:{metadata_source.value}"
+
+    # Callers that arrive while a probe is in flight queue here and read its result,
+    # rather than each starting a probe of their own into an empty cache.
+    async with _probe_locks[metadata_source]:
+        cached = sync_cache.get(cache_key)
+        if cached is not None:
+            return bool(int(cached))
+
+        is_alive = await _probe_metadata_source(metadata_source)
+        sync_cache.set(
+            cache_key, int(is_alive), ex=METADATA_HEARTBEAT_CACHE_TTL_SECONDS
+        )
+        return is_alive
+
+
+async def _probe_metadata_source(metadata_source: MetadataSource) -> bool:
+    match metadata_source:
+        case MetadataSource.IGDB:
+            return await meta_igdb_handler.heartbeat()
+        case MetadataSource.MOBY:
+            return await meta_moby_handler.heartbeat()
+        case MetadataSource.SS:
+            return await meta_ss_handler.heartbeat()
+        case MetadataSource.RA:
+            return await meta_ra_handler.heartbeat()
+        case MetadataSource.LAUNCHBOX:
+            return await meta_launchbox_handler.heartbeat()
+        case MetadataSource.HASHEOUS:
+            return await meta_hasheous_handler.heartbeat()
+        case MetadataSource.PLAYMATCH:
+            return await meta_playmatch_handler.heartbeat()
+        case MetadataSource.TGDB:
+            return await meta_tgdb_handler.heartbeat()
+        case MetadataSource.SGDB:
+            return await meta_sgdb_handler.heartbeat()
+        case MetadataSource.FLASHPOINT:
+            return await meta_flashpoint_handler.heartbeat()
+        case MetadataSource.HLTB:
+            return await meta_hltb_handler.heartbeat()
+        case MetadataSource.DEMOZOO:
+            return await meta_demozoo_handler.heartbeat()
+        case MetadataSource.POUET:
+            return await meta_pouet_handler.heartbeat()
+        case MetadataSource.CSDB:
+            return await meta_csdb_handler.heartbeat()
+        case MetadataSource.STEAM:
+            return await meta_steam_handler.heartbeat()
+        case MetadataSource.GAMELIST:
+            return await meta_gamelist_handler.heartbeat()
+        case MetadataSource.LIBRETRO:
+            return await meta_libretro_handler.heartbeat()
+        case _:
+            return False
+
+
+@protected_route(
+    router.get,
+    "/setup/library",
+    [],
+)
+async def get_setup_library_info(request: Request) -> SetupLibraryResponse:
+    """Get library structure information for setup wizard.
+
+    Only accessible during initial setup (no admin users) or with authentication.
+
+    Returns:
+        SetupLibraryResponse: The library folder state and the platforms to offer.
+    """
+
+    # Check authentication - only allow public access if no admin users
+    # If admin users exist, this would need authentication (but won't be called during setup)
+
+    if (
+        Scope.PLATFORMS_READ not in request.auth.scopes
+        and len(db_user_handler.get_admin_users()) > 0
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden",
+        )
+
+    library_ready = fs_platform_handler.library_structure_exists()
+
+    # The per-platform rom counts below are a first-run hint, so a fresh
+    # instance can show what RomM already sees on disk. Once the database
+    # holds ROMs that hint is dead weight, and building it walks every
+    # platform directory: tens of seconds on a large library.
+    if db_stats_handler.get_roms_count() > 0:
+        return {
+            "library_ready": library_ready,
+            "library_structure": cm.get_config().default_structure_pattern,
+            "existing_platforms": [],
+            "supported_platforms": get_supported_platforms(),
+        }
+
+    # Get existing platforms from filesystem
+    try:
+        existing_platform_slugs = await fs_platform_handler.get_platforms()
+    except Exception:
+        log.warning("Error retrieving existing platforms", exc_info=True)
+        existing_platform_slugs = []
+
+    # Build existing platforms with rom counts
+    existing_platforms: list[SetupExistingPlatform] = []
+    if library_ready and existing_platform_slugs:
+        for fs_slug in existing_platform_slugs:
+            rom_count = 0
+            try:
+                roms_path = os.path.join(
+                    LIBRARY_BASE_PATH,
+                    fs_platform_handler.get_platform_fs_structure(fs_slug),
+                )
+
+                # Count files and folders in the roms directory
+                roms_dir = AnyioPath(roms_path)
+                if await roms_dir.exists():
+                    items = [entry.name async for entry in roms_dir.iterdir()]
+                    # Filter out hidden files and system files
+                    rom_count = len(
+                        [
+                            item
+                            for item in items
+                            if not item.startswith(".")
+                            and item not in ["_resources", "_cache"]
+                        ]
+                    )
+            except Exception:
+                log.warning(
+                    f"Error counting ROMs for platform {fs_slug}", exc_info=True
+                )
+
+            existing_platforms.append(
+                {
+                    "fs_slug": fs_slug,
+                    "rom_count": rom_count,
+                }
+            )
+
+    # Get all supported platforms with metadata
+    supported_platforms = get_supported_platforms()
+
+    return {
+        "library_ready": library_ready,
+        "library_structure": cm.get_config().default_structure_pattern,
+        "existing_platforms": existing_platforms,
+        "supported_platforms": supported_platforms,
+    }
+
+
+@protected_route(
+    router.post,
+    "/setup/platforms",
+    [],
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_setup_platforms(
+    request: Request, platform_slugs: list[str]
+) -> SetupPlatformsResponse:
+    """Create platform folders during setup wizard.
+
+    Only accessible during initial setup (no admin users) or with authentication.
+
+    Args:
+        platform_slugs: List of platform fs_slugs to create
+
+    Returns:
+        SetupPlatformsResponse: How many platform folders were created.
+    """
+
+    if (
+        Scope.PLATFORMS_WRITE not in request.auth.scopes
+        and len(db_user_handler.get_admin_users()) > 0
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden",
+        )
+
+    if not platform_slugs:
+        return {
+            "success": True,
+            "created_count": 0,
+            "message": "No platforms selected",
+        }
+
+    try:
+        if not fs_platform_handler.library_structure_exists():
+            fs_platform_handler.create_library_structure()
+
+        # Create platform folders
+        created_count = 0
+        failed_platforms = []
+
+        for fs_slug in platform_slugs:
+            try:
+                await fs_platform_handler.add_platform(fs_slug=fs_slug)
+                created_count += 1
+            except PlatformAlreadyExistsException:
+                continue
+            except (PermissionError, OSError) as e:
+                failed_platforms.append(f"{fs_slug}: {str(e)}")
+
+        if failed_platforms:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to create some platform folders: {', '.join(failed_platforms)}",
+            )
+
+        return {
+            "success": True,
+            "created_count": created_count,
+            "message": f"Successfully created {created_count} platform folder(s)",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating platform folders: {str(e)}",
+        ) from e

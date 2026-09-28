@@ -1,0 +1,19 @@
+{
+  "clear": "Limpar",
+  "click-to-copy": "Clique para copiar para a área de transferência",
+  "copied": "Logs copiados para a área de transferência",
+  "copy": "Copiar para a área de transferência",
+  "download": "Baixar",
+  "empty": "Nenhum log ainda",
+  "jump-to-latest": "Ir para o mais recente",
+  "level-all": "Todos os níveis",
+  "level-filter": "Filtrar por nível",
+  "line-copied": "Linha copiada para a área de transferência",
+  "load-error": "Falha ao carregar os logs",
+  "module-all": "Todos os módulos",
+  "module-filter": "Filtrar por módulo",
+  "no-matches": "Nenhum log corresponde aos seus filtros",
+  "pause": "Pausar",
+  "resume": "Retomar",
+  "search-placeholder": "Pesquisar logs"
+}

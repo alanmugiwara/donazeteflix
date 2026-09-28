@@ -1,0 +1,935 @@
+import asyncio
+import errno
+import os
+import shutil
+import tempfile
+from io import BytesIO
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import pytest
+from fastapi import UploadFile
+
+from config.config_manager import DEFAULT_EXCLUDED_FILES
+from handler.filesystem.base_handler import (
+    FSHandler,
+    normalize_language,
+    normalize_provider_languages,
+    normalize_provider_regions,
+    provider_language_name,
+    provider_region_name,
+    region_ranks_for_priority,
+    translation_language,
+)
+from models.base import FILE_NAME_MAX_LENGTH
+
+
+class TestFSHandler:
+    """Test suite for FSHandler class"""
+
+    @pytest.fixture
+    def temp_dir(self):
+        """Create a temporary directory for testing"""
+        temp_dir = tempfile.mkdtemp()
+        yield temp_dir
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    @pytest.fixture
+    def handler(self, temp_dir):
+        """Create FSHandler instance for testing"""
+        return FSHandler(temp_dir)
+
+    @pytest.fixture
+    def sample_file_content(self):
+        """Sample file content for testing"""
+        return b"This is test content for file operations"
+
+    @pytest.fixture
+    def mock_upload_file(self, sample_file_content):
+        """Mock UploadFile for testing"""
+        mock_file = Mock(spec=UploadFile)
+        mock_file.filename = "test_file.txt"
+        mock_file.file = BytesIO(sample_file_content)
+        return mock_file
+
+    def test_init_creates_base_directory(self, temp_dir):
+        """Test that FSHandler creates base directory on initialization"""
+        # Remove the directory to test creation
+        shutil.rmtree(temp_dir)
+
+        handler = FSHandler(temp_dir)
+
+        assert handler.base_path.exists()
+        assert handler.base_path.is_dir()
+
+    def test_init_resolves_path(self, temp_dir):
+        """Test that FSHandler resolves the base path"""
+        handler = FSHandler(temp_dir)
+
+        assert handler.base_path == Path(temp_dir).resolve()
+
+    def test_sanitize_filename_valid(self, handler: FSHandler):
+        """Test filename sanitization with valid filenames"""
+        assert handler._sanitize_filename("test.txt") == "test.txt"
+        assert handler._sanitize_filename("file-name_123.zip") == "file-name_123.zip"
+        assert handler._sanitize_filename("file.name.ext") == "file.name.ext"
+
+    def test_sanitize_filename_path_traversal(self, handler: FSHandler):
+        """Test filename sanitization prevents path traversal"""
+        assert handler._sanitize_filename("../test.txt") == "test.txt"
+        assert handler._sanitize_filename("../../test.txt") == "test.txt"
+        assert handler._sanitize_filename("/etc/passwd") == "passwd"
+        assert handler._sanitize_filename("dir/../test.txt") == "test.txt"
+
+    def test_sanitize_filename_invalid(self, handler: FSHandler):
+        """Test filename sanitization with invalid filenames"""
+        with pytest.raises(ValueError, match="Empty filename"):
+            handler._sanitize_filename("")
+
+        with pytest.raises(ValueError, match="Invalid filename"):
+            handler._sanitize_filename(".")
+
+        with pytest.raises(ValueError, match="Invalid filename"):
+            handler._sanitize_filename("..")
+
+    def test_sanitize_filename_too_long(self, handler: FSHandler):
+        """Test filename sanitization with too long filenames"""
+        long_name = "a" * (FILE_NAME_MAX_LENGTH + 1)
+        with pytest.raises(ValueError, match="Filename .* exceeds maximum length"):
+            handler._sanitize_filename(long_name)
+
+    def test_validate_path_valid(self, handler: FSHandler):
+        """Test path validation with valid paths"""
+        valid_paths = [
+            "test.txt",
+            "dir/test.txt",
+            "dir/subdir/test.txt",
+            "test-file_123.txt",
+        ]
+
+        for path in valid_paths:
+            result = handler.validate_path(path)
+            assert result.is_relative_to(handler.base_path)
+
+    def test_validate_path_base_directory(self, handler: FSHandler):
+        base = Path(handler.base_path).resolve()
+        assert handler.validate_path("") == base
+        assert handler.validate_path(".") == base
+
+    async def test_compute_file_md5(self, handler: FSHandler):
+        await handler.write_file(b"romm", ".", "file.bin")
+        assert (
+            await handler.compute_file_md5("file.bin")
+            == "356bc0b7ad776f256d85069abcb4698c"
+        )
+
+    async def test_compute_file_md5_missing_file_raises(self, handler: FSHandler):
+        with pytest.raises(FileNotFoundError):
+            await handler.compute_file_md5("missing.bin")
+
+    def test_validate_path_traversal_attack(self, handler: FSHandler):
+        """Test path validation prevents directory traversal attacks"""
+        malicious_paths = [
+            "../test.txt",
+            "../../etc/passwd",
+            "dir/../../../etc/passwd",
+            "dir/../../test.txt",
+        ]
+
+        for path in malicious_paths:
+            with pytest.raises(
+                ValueError, match="Path .* contains invalid parent directory references"
+            ):
+                handler.validate_path(path)
+
+    def test_validate_path_absolute(self, handler: FSHandler):
+        """Test path validation rejects absolute paths"""
+        absolute_paths = ["/etc/passwd", "/tmp/test.txt", "/home/user/file.txt"]
+
+        for path in absolute_paths:
+            with pytest.raises(
+                ValueError, match="Path .* must be relative, not absolute"
+            ):
+                handler.validate_path(path)
+
+    def test_get_file_name_with_no_extension(self, handler: FSHandler):
+        """Test file name extraction without extension"""
+        assert handler.get_file_name_with_no_extension("test.txt") == "test"
+        assert handler.get_file_name_with_no_extension("file.tar.gz") == "file"
+        assert handler.get_file_name_with_no_extension("file.with.dots.txt") == "file"
+        assert handler.get_file_name_with_no_extension("no_extension") == "no_extension"
+
+    def test_get_file_name_with_no_tags(self, handler: FSHandler):
+        """Test file name extraction without tags"""
+        assert handler.get_file_name_with_no_tags("game (USA).rom") == "game"
+        assert handler.get_file_name_with_no_tags("game [Beta].rom") == "game"
+        assert handler.get_file_name_with_no_tags("game (USA) [Beta].rom") == "game"
+        assert handler.get_file_name_with_no_tags("plain_name.rom") == "plain_name"
+
+    def test_parse_file_extension(self, handler: FSHandler):
+        """Test file extension parsing"""
+        assert handler.parse_file_extension("test.txt") == "txt"
+        assert handler.parse_file_extension("file.tar.gz") == "tar.gz"
+        assert handler.parse_file_extension("no_extension") == ""
+        assert handler.parse_file_extension("file.with.dots.txt") == "with.dots.txt"
+
+    def test_exclude_single_files(self, handler: FSHandler):
+        """Test file exclusion functionality"""
+        files = ["test.txt", "game.rom", "excluded.tmp", "data.json"]
+
+        # Mock configuration
+        with patch("handler.filesystem.base_handler.cm.get_config") as mock_config:
+            mock_config.return_value.EXCLUDED_SINGLE_EXT = ["tmp"]
+            mock_config.return_value.EXCLUDED_SINGLE_FILES = ["test.txt"]
+
+            result = handler.exclude_single_files(files)
+
+            assert "excluded.tmp" not in result
+            assert "test.txt" not in result
+            assert "game.rom" in result
+            assert "data.json" in result
+
+    def test_exclude_single_files_multi_dot(self, handler: FSHandler):
+        """Test that files with multiple dots are excluded by last or compound extension"""
+        files = [
+            "game.nds",
+            "game.nds.hash.txt",
+            "game.nds.enc.hash.txt",
+            "readme.txt",
+            "game.rom",
+        ]
+
+        with patch("handler.filesystem.base_handler.cm.get_config") as mock_config:
+            # Exclude by last single extension
+            mock_config.return_value.EXCLUDED_SINGLE_EXT = ["txt"]
+            mock_config.return_value.EXCLUDED_SINGLE_FILES = []
+
+            result = handler.exclude_single_files(files)
+
+            assert "game.nds.hash.txt" not in result
+            assert "game.nds.enc.hash.txt" not in result
+            assert "readme.txt" not in result
+            assert "game.nds" in result
+            assert "game.rom" in result
+
+        with patch("handler.filesystem.base_handler.cm.get_config") as mock_config:
+            # Exclude by compound sub-extension "hash.txt"
+            mock_config.return_value.EXCLUDED_SINGLE_EXT = ["hash.txt"]
+            mock_config.return_value.EXCLUDED_SINGLE_FILES = []
+
+            result = handler.exclude_single_files(files)
+
+            assert "game.nds.hash.txt" not in result
+            assert "game.nds.enc.hash.txt" not in result
+            # "readme.txt" does NOT end in "hash.txt", so it should remain
+            assert "readme.txt" in result
+            assert "game.nds" in result
+            assert "game.rom" in result
+
+    def test_exclude_single_files_zone_identifier(self, handler: FSHandler):
+        files = ["game.iso", "game.iso:Zone.Identifier"]
+
+        with patch("handler.filesystem.base_handler.cm.get_config") as mock_config:
+            mock_config.return_value.EXCLUDED_SINGLE_EXT = []
+            mock_config.return_value.EXCLUDED_SINGLE_FILES = DEFAULT_EXCLUDED_FILES
+
+            assert handler.exclude_single_files(files) == ["game.iso"]
+
+    async def test_make_directory(self, handler: FSHandler):
+        """Test directory creation"""
+        await handler.make_directory("test_dir")
+
+        full_path = handler.base_path / "test_dir"
+        assert full_path.exists()
+        assert full_path.is_dir()
+
+    async def test_make_directory_nested(self, handler: FSHandler):
+        """Test nested directory creation"""
+        await handler.make_directory("parent/child/grandchild")
+
+        full_path = handler.base_path / "parent" / "child" / "grandchild"
+        assert full_path.exists()
+        assert full_path.is_dir()
+
+    async def test_make_directory_exists(self, handler: FSHandler):
+        """Test directory creation when directory already exists"""
+        await handler.make_directory("test_dir")
+        await handler.make_directory("test_dir")  # Should not raise error
+
+        full_path = handler.base_path / "test_dir"
+        assert full_path.exists()
+        assert full_path.is_dir()
+
+    async def test_make_directory_file_exists(self, handler: FSHandler):
+        """Test directory creation when file with same name exists"""
+        # Create a file first
+        (handler.base_path / "test_file").touch()
+
+        with pytest.raises(
+            FileNotFoundError, match="Path already exists and is not a directory"
+        ):
+            await handler.make_directory("test_file")
+
+    async def test_list_directories(self, handler: FSHandler):
+        """Test directory listing"""
+        # Create test directories
+        await handler.make_directory("dir1")
+        await handler.make_directory("dir2")
+        await handler.make_directory("parent/child")
+
+        # Create a file (should not be listed)
+        (handler.base_path / "file.txt").touch()
+
+        dirs = await handler.list_directories(".")
+        assert "dir1" in dirs
+        assert "dir2" in dirs
+        assert "parent" in dirs
+        assert "file.txt" not in dirs
+
+    async def test_list_directories_nonexistent(self, handler: FSHandler):
+        """Test directory listing with nonexistent directory"""
+        with pytest.raises(
+            FileNotFoundError, match="Path does not exist or is not a directory"
+        ):
+            await handler.list_directories("nonexistent")
+
+    async def test_remove_directory(self, handler: FSHandler):
+        """Test directory removal"""
+        # Create directory with content
+        await handler.make_directory("test_dir/subdir")
+        (handler.base_path / "test_dir" / "file.txt").touch()
+
+        await handler.remove_directory("test_dir")
+
+        assert not (handler.base_path / "test_dir").exists()
+
+    async def test_remove_directory_nonexistent(self, handler: FSHandler):
+        """Test directory removal with nonexistent directory"""
+        with pytest.raises(
+            FileNotFoundError, match="Path does not exist or is not a directory"
+        ):
+            await handler.remove_directory("nonexistent")
+
+    async def test_write_file_upload_file(self, handler: FSHandler, mock_upload_file):
+        """Test file writing with UploadFile"""
+        await handler.write_file(mock_upload_file, ".", "test_file.txt")
+
+        file_path = handler.base_path / "test_file.txt"
+        assert file_path.exists()
+        assert file_path.read_bytes() == b"This is test content for file operations"
+
+    async def test_write_file_bytes(self, handler: FSHandler, sample_file_content):
+        """Test file writing with bytes"""
+        await handler.write_file(sample_file_content, ".", "test_file.txt")
+
+        file_path = handler.base_path / "test_file.txt"
+        assert file_path.exists()
+        assert file_path.read_bytes() == sample_file_content
+
+    async def test_write_file_binary_io(self, handler: FSHandler, sample_file_content):
+        """Test file writing with BinaryIO"""
+        bio = BytesIO(sample_file_content)
+        await handler.write_file(bio, ".", "test_file.txt")
+
+        file_path = handler.base_path / "test_file.txt"
+        assert file_path.exists()
+        assert file_path.read_bytes() == sample_file_content
+
+    async def test_write_file_nested_path(
+        self, handler: FSHandler, sample_file_content
+    ):
+        """Test file writing in nested path"""
+        await handler.write_file(sample_file_content, "parent/child", "test_file.txt")
+
+        file_path = handler.base_path / "parent" / "child" / "test_file.txt"
+        assert file_path.exists()
+        assert file_path.read_bytes() == sample_file_content
+
+    async def test_write_file_no_filename(
+        self, handler: FSHandler, sample_file_content
+    ):
+        """Test file writing without filename"""
+        with pytest.raises(ValueError, match="Filename cannot be empty"):
+            await handler.write_file(sample_file_content, ".", None)
+
+    async def test_write_file_streamed(self, handler: FSHandler, sample_file_content):
+        """Test streamed file writing"""
+        async with handler.write_file_streamed(".", "test_file.txt") as f:
+            await f.write(sample_file_content)
+
+        file_path = handler.base_path / "test_file.txt"
+        assert file_path.exists()
+        assert file_path.read_bytes() == sample_file_content
+
+    async def test_read_file(self, handler: FSHandler, sample_file_content):
+        """Test file reading"""
+        # Write file first
+        await handler.write_file(sample_file_content, ".", "test_file.txt")
+
+        # Read file
+        content = await handler.read_file("test_file.txt")
+        assert content == sample_file_content
+
+    async def test_read_file_nonexistent(self, handler: FSHandler):
+        """Test reading nonexistent file"""
+        with pytest.raises(FileNotFoundError, match="File not found"):
+            await handler.read_file("nonexistent.txt")
+
+    async def test_stream_file(self, handler: FSHandler, sample_file_content):
+        """Test file streaming"""
+        # Write file first
+        await handler.write_file(sample_file_content, ".", "test_file.txt")
+
+        # Stream file
+        async with await handler.stream_file("test_file.txt") as f:
+            content = await f.read()
+
+        assert content == sample_file_content
+
+    async def test_stream_file_nonexistent(self, handler: FSHandler):
+        """Test streaming nonexistent file"""
+        with pytest.raises(FileNotFoundError, match="File not found"):
+            await handler.stream_file("nonexistent.txt")
+
+    async def test_move_file(self, handler: FSHandler, sample_file_content):
+        """Test file moving"""
+        # Write source file
+        await handler.write_file(sample_file_content, ".", "source.txt")
+
+        # Move file
+        await handler.move_file_or_folder("source.txt", "destination.txt")
+
+        assert not (handler.base_path / "source.txt").exists()
+        assert (handler.base_path / "destination.txt").exists()
+        assert (
+            handler.base_path / "destination.txt"
+        ).read_bytes() == sample_file_content
+
+    async def test_move_file_to_nested_path(
+        self, handler: FSHandler, sample_file_content
+    ):
+        """Test moving file to nested path"""
+        # Write source file
+        await handler.write_file(sample_file_content, ".", "source.txt")
+
+        # Move file to nested path
+        await handler.move_file_or_folder("source.txt", "parent/child/destination.txt")
+
+        assert not (handler.base_path / "source.txt").exists()
+        assert (handler.base_path / "parent" / "child" / "destination.txt").exists()
+
+    async def test_move_file_nonexistent(self, handler: FSHandler):
+        """Test moving nonexistent file"""
+        with pytest.raises(FileNotFoundError, match="Source file or folder not found"):
+            await handler.move_file_or_folder("nonexistent.txt", "destination.txt")
+
+    async def test_rename_file_stays_in_its_directory(
+        self, handler: FSHandler, sample_file_content
+    ):
+        await handler.write_file(sample_file_content, "saves/gba", "old.srm")
+
+        await handler.rename_file("saves/gba/old.srm", "new.srm")
+
+        assert not (handler.base_path / "saves/gba/old.srm").exists()
+        assert (
+            handler.base_path / "saves/gba/new.srm"
+        ).read_bytes() == sample_file_content
+
+    async def test_rename_file_keeps_only_the_base_name(
+        self, handler: FSHandler, sample_file_content
+    ):
+        await handler.write_file(sample_file_content, "saves/gba", "old.srm")
+
+        await handler.rename_file("saves/gba/old.srm", "../../escaped.srm")
+
+        assert (handler.base_path / "saves/gba/escaped.srm").exists()
+        assert not (handler.base_path / "escaped.srm").exists()
+
+    async def test_rename_file_refuses_to_replace_another_file(
+        self, handler: FSHandler, sample_file_content
+    ):
+        await handler.write_file(sample_file_content, ".", "old.srm")
+        await handler.write_file(b"other", ".", "taken.srm")
+
+        with pytest.raises(FileExistsError, match="File already exists"):
+            await handler.rename_file("old.srm", "taken.srm")
+
+        assert (handler.base_path / "old.srm").read_bytes() == sample_file_content
+        assert (handler.base_path / "taken.srm").read_bytes() == b"other"
+
+    async def test_rename_file_to_its_own_name_is_a_no_op(
+        self, handler: FSHandler, sample_file_content
+    ):
+        await handler.write_file(sample_file_content, ".", "same.srm")
+
+        await handler.rename_file("same.srm", "same.srm")
+
+        assert (handler.base_path / "same.srm").read_bytes() == sample_file_content
+
+    async def test_copy_to_new_file_leaves_the_source(
+        self, handler: FSHandler, sample_file_content
+    ):
+        await handler.write_file(sample_file_content, ".", "shot.png")
+
+        await handler.copy_to_new_file("shot.png", "copy.png")
+
+        assert (handler.base_path / "shot.png").read_bytes() == sample_file_content
+        assert (handler.base_path / "copy.png").read_bytes() == sample_file_content
+
+    async def test_copy_to_new_file_refuses_to_replace_a_file(
+        self, handler: FSHandler, sample_file_content
+    ):
+        await handler.write_file(sample_file_content, ".", "shot.png")
+        await handler.write_file(b"other", ".", "taken.png")
+
+        with pytest.raises(FileExistsError):
+            await handler.copy_to_new_file("shot.png", "taken.png")
+        with pytest.raises(FileExistsError):
+            await handler.copy_to_new_file("shot.png", "shot.png")
+
+        assert (handler.base_path / "taken.png").read_bytes() == b"other"
+
+    async def test_copy_to_new_file_leaves_nothing_when_the_copy_fails(
+        self, handler: FSHandler, sample_file_content
+    ):
+        await handler.write_file(sample_file_content, ".", "shot.png")
+
+        with (
+            patch(
+                "handler.filesystem.base_handler.os.link",
+                side_effect=OSError(errno.EXDEV, "cross-device link"),
+            ),
+            patch(
+                "handler.filesystem.base_handler.shutil.copyfileobj",
+                side_effect=OSError(errno.ENOSPC, "no space left"),
+            ),
+            pytest.raises(OSError, match="no space left"),
+        ):
+            await handler.copy_to_new_file("shot.png", "copy.png")
+
+        assert not (handler.base_path / "copy.png").exists()
+        assert (handler.base_path / "shot.png").read_bytes() == sample_file_content
+
+    async def test_is_same_file_follows_the_file_not_the_name(
+        self, handler: FSHandler, sample_file_content
+    ):
+        await handler.write_file(sample_file_content, ".", "shot.png")
+        await handler.write_file(b"other", ".", "other.png")
+        # A second link stands in for a case-insensitive filesystem's alias.
+        os.link(handler.base_path / "shot.png", handler.base_path / "Shot.png")
+
+        assert handler.is_same_file("shot.png", "shot.png")
+        assert handler.is_same_file("shot.png", "Shot.png")
+        assert not handler.is_same_file("shot.png", "other.png")
+        assert not handler.is_same_file("shot.png", "missing.png")
+
+    async def test_rename_file_nonexistent(self, handler: FSHandler):
+        with pytest.raises(FileNotFoundError, match="File not found"):
+            await handler.rename_file("nonexistent.srm", "new.srm")
+
+    async def test_remove_file(self, handler: FSHandler, sample_file_content):
+        """Test file removal"""
+        # Write file first
+        await handler.write_file(sample_file_content, ".", "test_file.txt")
+
+        # Remove file
+        await handler.remove_file("test_file.txt")
+
+        assert not (handler.base_path / "test_file.txt").exists()
+
+    async def test_remove_file_nonexistent(self, handler: FSHandler):
+        """Test removing nonexistent file"""
+        with pytest.raises(FileNotFoundError, match="File not found"):
+            await handler.remove_file("nonexistent.txt")
+
+    async def test_list_files(self, handler: FSHandler, sample_file_content):
+        """Test file listing"""
+        # Create test files
+        await handler.write_file(sample_file_content, ".", "file1.txt")
+        await handler.write_file(sample_file_content, ".", "file2.txt")
+        await handler.make_directory("subdir")
+
+        files = await handler.list_files(".")
+        assert "file1.txt" in files
+        assert "file2.txt" in files
+        assert "subdir" not in files  # Directories should not be listed
+
+    async def test_list_files_nonexistent(self, handler: FSHandler):
+        """Test listing files in nonexistent directory"""
+        with pytest.raises(FileNotFoundError, match="Directory not found"):
+            await handler.list_files("nonexistent")
+
+    async def test_file_exists(self, handler: FSHandler, sample_file_content):
+        """Test file existence check"""
+        assert not await handler.file_exists("test_file.txt")
+
+        await handler.write_file(sample_file_content, ".", "test_file.txt")
+        assert await handler.file_exists("test_file.txt")
+
+    async def test_file_exists_directory(self, handler: FSHandler):
+        """Test file existence check on directory"""
+        await handler.make_directory("test_dir")
+        assert not await handler.file_exists(
+            "test_dir"
+        )  # Should return False for directories
+
+    async def test_get_file_size(self, handler: FSHandler, sample_file_content):
+        """Test file size retrieval"""
+        await handler.write_file(sample_file_content, ".", "test_file.txt")
+
+        size = await handler.get_file_size("test_file.txt")
+        assert size == len(sample_file_content)
+
+    async def test_get_file_size_nonexistent(self, handler: FSHandler):
+        """Test file size retrieval for nonexistent file"""
+        with pytest.raises(FileNotFoundError, match="File not found"):
+            await handler.get_file_size("nonexistent.txt")
+
+    async def test_async_concurrency(self, handler: FSHandler):
+        """Test async concurrency of file operations"""
+
+        async def write_file(filename, content):
+            await handler.write_file(content, ".", filename)
+
+        # Test concurrent file writes using asyncio
+        tasks = []
+        for i in range(10):
+            content = f"Content {i}".encode()
+            task = write_file(f"file_{i}.txt", content)
+            tasks.append(task)
+
+        # Wait for all to complete
+        await asyncio.gather(*tasks)
+
+        # Verify all files were written correctly
+        for i in range(10):
+            assert await handler.file_exists(f"file_{i}.txt")
+            content = await handler.read_file(f"file_{i}.txt")
+            assert content == f"Content {i}".encode()
+
+    async def test_empty_path_validation(self, handler: FSHandler):
+        """Test validation of empty paths"""
+        with pytest.raises(ValueError, match="cannot be empty"):
+            await handler.read_file("")
+
+        with pytest.raises(ValueError, match="cannot be empty"):
+            await handler.file_exists("")
+
+        with pytest.raises(ValueError, match="cannot be empty"):
+            await handler.get_file_size("")
+
+    async def test_atomic_write_rollback(self, handler: FSHandler):
+        """Test atomic write rollback on failure"""
+
+        # Mock a failure during file write
+        def failing_move(*args, **kwargs):
+            raise OSError("Simulated failure")
+
+        with patch("os.replace", side_effect=failing_move):
+            with pytest.raises(OSError, match="Simulated failure"):
+                await handler.write_file(b"test content", ".", "test_file.txt")
+
+        # Verify no temporary files are left behind
+        temp_files = [f for f in await handler.list_files(".") if f.startswith(".tmp_")]
+        assert len(temp_files) == 0
+
+        # Verify the target file was not created
+        assert not await handler.file_exists("test_file.txt")
+
+    async def test_concurrent_directory_operations(self, handler: FSHandler):
+        """Test concurrent directory operations"""
+
+        async def create_and_remove_dir(dir_name):
+            await handler.make_directory(dir_name)
+            await handler.remove_directory(dir_name)
+
+        # Test concurrent directory operations using asyncio
+        tasks = []
+        for i in range(5):
+            task = create_and_remove_dir(f"test_dir_{i}")
+            tasks.append(task)
+
+        # Wait for all to complete
+        await asyncio.gather(*tasks)
+
+        # Verify all directories were cleaned up
+        dirs = await handler.list_directories(".")
+        for i in range(5):
+            assert f"test_dir_{i}" not in dirs
+
+    async def test_copy_file_does_not_hardlink_by_default(
+        self, handler: FSHandler, sample_file_content
+    ):
+        """copy_file defaults to allow_link=False: the destination is a real
+        copy, so mutating it won't affect the source. Callers must opt in to
+        hardlinking explicitly."""
+        source_full = handler.base_path / "source.bin"
+        source_full.write_bytes(sample_file_content)
+
+        await handler.copy_file(source_full, "dest.bin")
+
+        dest_full = handler.base_path / "dest.bin"
+        assert dest_full.read_bytes() == sample_file_content
+        assert source_full.stat().st_ino != dest_full.stat().st_ino
+
+    async def test_copy_file_allow_link_true_hardlinks(
+        self, handler: FSHandler, sample_file_content
+    ):
+        """allow_link=True: when source and dest are on the same filesystem,
+        the destination is a hardlink to the source (same inode)."""
+        source_full = handler.base_path / "source.bin"
+        source_full.write_bytes(sample_file_content)
+
+        await handler.copy_file(source_full, "dest.bin", allow_link=True)
+
+        dest_full = handler.base_path / "dest.bin"
+        assert dest_full.read_bytes() == sample_file_content
+        assert source_full.stat().st_ino == dest_full.stat().st_ino
+
+    async def test_copy_file_allow_link_false_does_real_copy(
+        self, handler: FSHandler, sample_file_content
+    ):
+        """allow_link=False (explicit) produces a real copy — content matches
+        but inodes differ. This matches the default but is exercised explicitly
+        to lock in the contract."""
+        source_full = handler.base_path / "source.bin"
+        source_full.write_bytes(sample_file_content)
+
+        await handler.copy_file(source_full, "dest.bin", allow_link=False)
+
+        dest_full = handler.base_path / "dest.bin"
+        assert dest_full.read_bytes() == sample_file_content
+        assert source_full.stat().st_ino != dest_full.stat().st_ino
+
+    async def test_copy_file_allow_link_falls_back_to_copy_on_exdev(
+        self, handler: FSHandler, sample_file_content
+    ):
+        """When allow_link=True and os.link raises EXDEV (cross-filesystem),
+        copy_file transparently falls back to a real copy."""
+        source_full = handler.base_path / "source.bin"
+        source_full.write_bytes(sample_file_content)
+
+        with patch(
+            "utils.filesystem.os.link",
+            side_effect=OSError(errno.EXDEV, "Cross-device link"),
+        ):
+            await handler.copy_file(source_full, "dest.bin", allow_link=True)
+
+        dest_full = handler.base_path / "dest.bin"
+        assert dest_full.read_bytes() == sample_file_content
+        assert source_full.stat().st_ino != dest_full.stat().st_ino
+
+    async def test_copy_file_nonexistent_source(self, handler: FSHandler):
+        """Missing source must raise FileNotFoundError regardless of link mode."""
+        with pytest.raises(FileNotFoundError, match="Source file not found"):
+            await handler.copy_file(handler.base_path / "missing.bin", "dest.bin")
+
+
+class TestFSHandlerInit:
+    def test_raises_on_mkdir_failure(self):
+        """OSError from mkdir propagates, so misconfigured paths fail loudly
+        at construction time. Optional features should defer construction
+        (e.g. via a lazy factory) rather than swallow the error."""
+        with patch.object(
+            Path, "mkdir", side_effect=PermissionError(errno.EACCES, "denied")
+        ):
+            with pytest.raises(PermissionError):
+                FSHandler("/some/unwritable/path")
+
+
+class TestRegionRanksForPriority:
+    """Ranking is per configured shortcode, not per expanded region name."""
+
+    def test_two_names_sharing_a_shortcode_rank_equally(self):
+        ranks = region_ranks_for_priority(["nl", "jp"])
+
+        assert ranks["Holland"] == ranks["Netherlands"]
+        # And the next shortcode still ranks strictly below them.
+        assert ranks["Japan"] > ranks["Netherlands"]
+
+    def test_unknown_shortcode_does_not_shift_later_ranks(self):
+        # "ss" is a ScreenScraper bucket, not a region.
+        assert region_ranks_for_priority(["us", "ss", "jp"]) == {
+            "USA": 0,
+            "Japan": 1,
+        }
+
+    def test_repeated_shortcode_does_not_shift_later_ranks(self):
+        assert region_ranks_for_priority(["us", "us", "jp"]) == {
+            "USA": 0,
+            "Japan": 1,
+        }
+
+    def test_ranks_follow_the_configured_order(self):
+        ranks = region_ranks_for_priority(["jp", "us"])
+
+        assert ranks["Japan"] < ranks["USA"]
+
+    def test_empty_priority_yields_no_ranks(self):
+        assert region_ranks_for_priority([]) == {}
+
+
+class TestTranslationLanguage:
+    @pytest.mark.parametrize(
+        ("code", "expected"),
+        [
+            ("Eng", "English"),
+            ("En", "English"),
+            ("Ita", "Italian"),
+            ("It", "Italian"),
+            ("Ge", "German"),
+            ("Sp", "Spanish"),
+            ("Du", "Dutch"),
+            ("Gr", "Greek"),
+            ("Jp", "Japanese"),
+        ],
+    )
+    def test_resolves_the_forms_a_translation_tag_uses(self, code: str, expected: str):
+        assert translation_language(code) == expected
+
+    def test_an_unnamed_language_resolves_to_none(self):
+        assert translation_language("Tha") is None
+
+
+class TestNormalizeProviderRegions:
+    """Provider shortcodes collapse onto the names filename parsing produces."""
+
+    def test_provider_shortcodes_resolve_to_canonical_names(self):
+        assert normalize_provider_regions(["us", "eu", "wor", "asi"]) == [
+            "USA",
+            "Europe",
+            "World",
+            "Asia",
+        ]
+
+    def test_filename_spellings_are_accepted_too(self):
+        assert normalize_provider_regions(["usa", "J", "EUROPE"]) == [
+            "USA",
+            "Japan",
+            "Europe",
+        ]
+
+    def test_shortcode_shared_with_a_language_stays_a_region(self):
+        # "de" and "fr" also spell a language tag, but a provider reporting
+        # them under a region field means Germany and France.
+        assert normalize_provider_regions(["de", "fr"]) == ["Germany", "France"]
+
+    def test_duplicate_spellings_collapse_to_one_value(self):
+        assert normalize_provider_regions(["us", "USA", "U"]) == ["USA"]
+
+    def test_unknown_value_is_kept_as_given(self):
+        assert normalize_provider_regions([" Neptune "]) == ["Neptune"]
+
+    def test_blank_values_are_dropped(self):
+        assert normalize_provider_regions(["", "  ", "us"]) == ["USA"]
+
+
+class TestNormalizeProviderLanguages:
+    """ISO-639-1 codes collapse onto the names filename parsing produces."""
+
+    def test_iso_codes_resolve_to_canonical_names(self):
+        assert normalize_provider_languages(["en", "fr", "ja"]) == [
+            "English",
+            "French",
+            "Japanese",
+        ]
+
+    def test_duplicate_spellings_collapse_to_one_value(self):
+        assert normalize_provider_languages(["en", "English", "EN"]) == ["English"]
+
+    def test_unknown_value_is_kept_as_given(self):
+        assert normalize_provider_languages([" Klingon "]) == ["Klingon"]
+
+    def test_blank_values_are_dropped(self):
+        assert normalize_provider_languages(["", "  ", "en"]) == ["English"]
+
+
+# Every region ScreenScraper can report, from its published list. Providers
+# send these bare, so one that resolves to nothing becomes a facet value.
+SCREENSCRAPER_REGION_CODES = (
+    "de",
+    "asi",
+    "au",
+    "br",
+    "bg",
+    "ca",
+    "cl",
+    "cn",
+    "ame",
+    "kr",
+    "dk",
+    "sp",
+    "eu",
+    "fi",
+    "fr",
+    "gr",
+    "hu",
+    "il",
+    "it",
+    "jp",
+    "kw",
+    "wor",
+    "mor",
+    "no",
+    "nz",
+    "oce",
+    "nl",
+    "pe",
+    "pl",
+    "pt",
+    "cz",
+    "uk",
+    "ru",
+    "sk",
+    "se",
+    "tw",
+    "tr",
+    "us",
+)
+
+# The buckets that name no place. Both readers drop these rather than store them.
+SCREENSCRAPER_PSEUDO_REGIONS = ("ss", "cus")
+
+
+class TestProviderVocabularyCoverage:
+    """A code a provider can send has to resolve, or it lands in a facet raw."""
+
+    @pytest.mark.parametrize("code", SCREENSCRAPER_REGION_CODES)
+    def test_every_screenscraper_region_resolves(self, code: str):
+        assert provider_region_name(code) is not None
+
+    @pytest.mark.parametrize("code", SCREENSCRAPER_PSEUDO_REGIONS)
+    def test_the_screenscraper_buckets_resolve_to_nothing(self, code: str):
+        assert provider_region_name(code) is None
+
+    @pytest.mark.parametrize(
+        "code,expected",
+        [
+            ("pl", "Poland"),
+            ("cz", "Czech Republic"),
+            ("tr", "Turkey"),
+            ("wor", "World"),
+        ],
+    )
+    def test_a_region_with_no_filename_shortcode_still_canonicalizes(
+        self, code: str, expected: str
+    ):
+        assert normalize_provider_regions([code]) == [expected]
+
+    @pytest.mark.parametrize(
+        "code,expected",
+        [("cs", "Czech"), ("tr", "Turkish"), ("he", "Hebrew"), ("uk", "Ukrainian")],
+    )
+    def test_an_iso_language_with_no_filename_shortcode_canonicalizes(
+        self, code: str, expected: str
+    ):
+        assert normalize_provider_languages([code]) == [expected]
+
+    def test_the_provider_languages_stay_out_of_filename_parsing(self):
+        """A filename "(Tr)" marks a translation, not Turkish."""
+        assert normalize_language("tr") is None
+        assert provider_language_name("tr") == "Turkish"
+
+    def test_a_provider_name_resolves_to_the_same_value_as_its_code(self):
+        assert provider_region_name("Poland") == provider_region_name("pl")
+        assert provider_language_name("czech") == provider_language_name("cs")

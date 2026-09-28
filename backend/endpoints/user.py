@@ -1,0 +1,680 @@
+import json
+from typing import Annotated, Any, Final, cast
+
+from fastapi import Body, Form, HTTPException
+from fastapi import Path as PathVar
+from fastapi import Request, status
+from fastapi.responses import FileResponse
+
+from decorators.auth import protected_route
+from endpoints.forms.identity import UserForm
+from endpoints.permissions import emit_permissions_changed
+from endpoints.responses.identity import InviteLinkSchema, UserSchema
+from handler.audit_handler import (
+    AuditActor,
+    AuditTarget,
+    change,
+    changed_fields,
+    client_ip,
+    record,
+)
+from handler.auth import auth_handler
+from handler.auth.constants import Scope
+from handler.database import (
+    db_client_token_handler,
+    db_device_handler,
+    db_user_handler,
+)
+from handler.device_install import device_install_handler
+from handler.filesystem import fs_asset_handler
+from handler.filesystem.assets_handler import (
+    build_asset_file_response,
+    validate_image_upload,
+)
+from handler.metadata import meta_ra_handler
+from handler.metadata.ra_handler import RAUserProgression
+from handler.notification_handler import notify
+from handler.socket_handler import close_client_token_sockets
+from logger.logger import log
+from models.audit_event import AuditAction
+from models.notification import NotificationKind, NotificationLevel
+from models.user import Role, User
+from utils.router import APIRouter
+from utils.validation import (
+    ValidationError,
+    validate_email,
+    validate_password,
+    validate_username,
+)
+
+router = APIRouter(
+    prefix="/users",
+    tags=["users"],
+)
+
+
+# What a user edit reports; ui_settings and avatars change too often to be news.
+_USER_EDIT_AUDIT_FIELDS: Final = (
+    "username",
+    "email",
+    "hashed_password",
+    "role",
+    "enabled",
+)
+
+
+def _record_user_edit(
+    request: Request, before: User, after: User, cleaned_data: dict[str, Any]
+) -> None:
+    changed = changed_fields(
+        before, after, [f for f in _USER_EDIT_AUDIT_FIELDS if f in cleaned_data]
+    )
+    if not changed:
+        return
+    data: dict[str, Any] = {
+        "changed": ["password" if f == "hashed_password" else f for f in changed]
+    }
+    for field in ("username", "role", "enabled"):
+        if field in changed:
+            data[field] = change(before, after, field)
+    record(AuditAction.USER_EDIT, request, AuditTarget.of_user(after), data)
+
+
+@protected_route(
+    router.post,
+    "",
+    [],
+    status_code=status.HTTP_201_CREATED,
+)
+def add_user(
+    request: Request,
+    username: str = Body(..., embed=True),
+    email: str = Body(..., embed=True),
+    password: str = Body(..., embed=True),
+    role: str = Body(..., embed=True),
+) -> UserSchema:
+    """Create user endpoint
+
+    Args:
+        request (Request): Fastapi Requests object
+        username (str): User username
+        password (str): User password
+        email (str): User email
+        role (str): RomM Role object represented as string
+
+    Returns:
+        UserSchema: Newly created user
+    """
+
+    admins_exist = len(db_user_handler.get_admin_users()) > 0
+
+    # If there are admin users already, enforce the USERS_WRITE scope.
+    if Scope.USERS_WRITE not in request.auth.scopes and admins_exist:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden",
+        )
+
+    coerced_role = Role.coerce(role)
+    # USERS_WRITE is delegable to non-admins via permission groups, but creating
+    # an admin must stay admin-only or it becomes a privilege-escalation path.
+    if (
+        admins_exist
+        and coerced_role == Role.ADMIN
+        and getattr(request.user, "role", None) != Role.ADMIN
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only an administrator can create admin users",
+        )
+
+    try:
+        validate_username(username)
+        validate_password(password)
+        validate_email(email)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=exc.message,
+        ) from exc
+
+    if db_user_handler.get_user_by_username(username):
+        msg = f"Username {username} already exists"
+        log.error(msg)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=msg,
+        )
+
+    if email and db_user_handler.get_user_by_email(email):
+        msg = f"User with email {email} already exists"
+        log.error(msg)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=msg,
+        )
+
+    user = User(
+        username=username.lower(),
+        hashed_password=auth_handler.get_password_hash(password),
+        email=email.lower() or None,
+        role=coerced_role,
+    )
+
+    created_user = db_user_handler.add_user(user)
+    record(
+        AuditAction.USER_CREATE,
+        request,
+        AuditTarget.of_user(created_user),
+        {"role": created_user.role},
+    )
+
+    return UserSchema.model_validate(created_user)
+
+
+@protected_route(
+    router.post,
+    "/invite-link",
+    [],
+    status_code=status.HTTP_201_CREATED,
+)
+def create_invite_link(
+    request: Request, role: str, expiration: int | None = None
+) -> InviteLinkSchema:
+    """Create an invite link for a user.
+
+    Args:
+        request (Request): FastAPI Request object
+        role (str): The role of the user
+        expiration (int | None): Token expiration in seconds. Defaults to
+            the INVITE_TOKEN_EXPIRY_SECONDS environment variable.
+
+    Returns:
+        InviteLinkSchema: Invite link
+    """
+
+    admins_exist = len(db_user_handler.get_admin_users()) > 0
+
+    if Scope.USERS_WRITE not in request.auth.scopes and admins_exist:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden",
+        )
+
+    if role not in [r.value for r in Role]:
+        msg = f"Role {role} is not valid"
+        log.error(msg)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=msg,
+        )
+
+    # Mirrors add_user: only a real admin can mint admin invite links.
+    if (
+        admins_exist
+        and Role.coerce(role) == Role.ADMIN
+        and getattr(request.user, "role", None) != Role.ADMIN
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only an administrator can create admin invite links",
+        )
+
+    if expiration is not None and expiration <= 0:
+        msg = "Invite link expiration must be a positive integer"
+        log.error(msg)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=msg,
+        )
+
+    token = auth_handler.generate_invite_link_token(
+        request.user, role=role, expiration=expiration
+    )
+    return InviteLinkSchema.from_token(token)
+
+
+@router.post("/register", status_code=status.HTTP_201_CREATED)
+def create_user_from_invite(
+    request: Request,
+    username: str = Body(..., embed=True),
+    email: str = Body(..., embed=True),
+    password: str = Body(..., embed=True),
+    token: str = Body(..., embed=True),
+) -> UserSchema:
+    """Create user endpoint with invite link
+
+    Args:
+        username (str): User username
+        email (str): User email
+        password (str): User password
+        token (str): Invite link token
+
+    Returns:
+        UserSchema: Newly created user
+    """
+
+    # Ahead of the "already exists" checks, which would otherwise enumerate
+    # accounts for an invalid token. Not consumed, so a retry keeps the invite.
+    auth_handler.assert_invite_link_token_valid(token)
+
+    try:
+        validate_username(username)
+        validate_password(password)
+        validate_email(email)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=exc.message,
+        ) from exc
+
+    if db_user_handler.get_user_by_username(username):
+        msg = f"Username {username} already exists"
+        log.error(msg)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=msg,
+        )
+
+    if email and db_user_handler.get_user_by_email(email):
+        msg = f"User with email {email} already exists"
+        log.error(msg)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=msg,
+        )
+
+    role = auth_handler.consume_invite_link_token(token)
+    user = User(
+        username=username.lower(),
+        hashed_password=auth_handler.get_password_hash(password),
+        email=email.lower() or None,
+        role=Role.coerce(role),
+    )
+
+    created_user = db_user_handler.add_user(user)
+    record(
+        AuditAction.USER_REGISTER,
+        AuditActor.for_user(created_user, ip_address=client_ip(request)),
+        AuditTarget.of_user(created_user),
+        {"role": created_user.role, "via": "invite"},
+    )
+
+    return UserSchema.model_validate(created_user)
+
+
+@protected_route(router.get, "", [Scope.USERS_READ])
+def get_users(request: Request) -> list[UserSchema]:
+    """Get all users endpoint
+
+    Args:
+        request (Request): Fastapi Request object
+
+    Returns:
+        list[UserSchema]: All users stored in the RomM's database
+    """
+
+    return [UserSchema.model_validate(u) for u in db_user_handler.get_users()]
+
+
+@protected_route(router.get, "/identifiers", [Scope.USERS_READ])
+def get_user_identifiers(
+    request: Request,
+) -> list[int]:
+    """Get all user identifiers endpoint
+
+    Args:
+        request (Request): Fastapi Request object
+
+    Returns:
+        list[int]: All user ids stored in the RomM's database
+    """
+
+    users = db_user_handler.get_users(only_fields=[User.id])
+    return [u.id for u in users]
+
+
+@protected_route(router.get, "/me", [Scope.ME_READ])
+def get_current_user(request: Request) -> UserSchema | None:
+    """Get current user endpoint
+
+    Args:
+        request (Request): Fastapi Request object
+
+    Returns:
+        UserSchema | None: Current user
+    """
+
+    return UserSchema.from_orm_with_request(request.user, request)
+
+
+@protected_route(router.get, "/{id}", [Scope.USERS_READ])
+def get_user(request: Request, id: int) -> UserSchema:
+    """Get user endpoint
+
+    Args:
+        request (Request): Fastapi Request object
+
+    Returns:
+        UserSchem: User stored in the RomM's database
+    """
+
+    user = db_user_handler.get_user(id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return UserSchema.model_validate(user)
+
+
+@protected_route(
+    router.get,
+    "/{id}/avatar",
+    [Scope.ASSETS_READ],
+    responses={status.HTTP_404_NOT_FOUND: {}},
+)
+def get_user_avatar(
+    request: Request,
+    id: Annotated[int, PathVar(description="User internal id.", ge=1)],
+) -> FileResponse:
+    """Serve a user's avatar image. Avatars are public to any authenticated
+    user (rendered next to community content, activity, and user lists)."""
+    user = db_user_handler.get_user(id)
+    if not user or not user.avatar_path:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Avatar not found"
+        )
+
+    try:
+        file_path = fs_asset_handler.validate_path(user.avatar_path)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Avatar not found"
+        ) from None
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Avatar not found"
+        )
+
+    return build_asset_file_response(file_path)
+
+
+@protected_route(router.put, "/{id}", [Scope.ME_WRITE])
+async def update_user(
+    request: Request, id: int, form_data: Annotated[UserForm, Form()]
+) -> UserSchema:
+    """Update user endpoint
+
+    Args:
+        request (Request): Fastapi Requests object
+        user_id (int): User internal id
+        form_data (Annotated[UserUpdateForm, Depends): Form Data with user updated info
+
+    Raises:
+        HTTPException: User is not found in database
+        HTTPException: Username already in use by another user
+
+    Returns:
+        UserSchema: Updated user info
+    """
+
+    db_user = db_user_handler.get_user(id)
+    if not db_user:
+        msg = f"Username with id {id} not found"
+        log.error(msg)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
+
+    # Admin users can edit any user, while other users can only edit self
+    if db_user.id != request.user.id and request.user.role != Role.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    cleaned_data: dict[str, Any] = {}
+
+    if form_data.username and form_data.username != db_user.username:
+        try:
+            validate_username(form_data.username)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=exc.message,
+            ) from exc
+
+        if db_user_handler.get_user_by_username(form_data.username):
+            msg = f"Username {form_data.username} already exists"
+            log.error(msg)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=msg,
+            )
+
+        cleaned_data["username"] = form_data.username.lower()
+
+    if form_data.password:
+        try:
+            validate_password(form_data.password)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=exc.message,
+            ) from exc
+        cleaned_data["hashed_password"] = auth_handler.get_password_hash(
+            form_data.password
+        )
+
+    if form_data.email is not None and form_data.email != db_user.email:
+        try:
+            validate_email(form_data.email)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=exc.message,
+            ) from exc
+
+        if form_data.email and db_user_handler.get_user_by_email(form_data.email):
+            msg = f"User with email {form_data.email} already exists"
+            log.error(msg)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=msg,
+            )
+
+        cleaned_data["email"] = form_data.email.lower() or None
+
+    # You can't change your own role
+    if form_data.role and request.user.id != id:
+        new_role = Role.coerce(form_data.role)
+        # You can't demote the last admin (mirrors the delete guard).
+        if (
+            db_user.role == Role.ADMIN
+            and new_role != Role.ADMIN
+            and len(db_user_handler.get_admin_users()) == 1
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You cannot demote the last admin user",
+            )
+        cleaned_data["role"] = new_role
+
+    # You can't disable yourself
+    if form_data.enabled is not None and request.user.id != id:
+        cleaned_data["enabled"] = form_data.enabled
+
+    if form_data.ra_username:
+        cleaned_data["ra_username"] = form_data.ra_username
+
+    if form_data.ui_settings is not None:
+        try:
+            ui_settings = json.loads(form_data.ui_settings)
+            if not isinstance(ui_settings, dict):
+                msg = f"Invalid ui_settings JSON: {ui_settings}"
+                log.error(msg)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=msg,
+                )
+            cleaned_data["ui_settings"] = ui_settings
+        except (json.JSONDecodeError, ValueError) as exc:
+            msg = f"Invalid ui_settings JSON: {str(exc)}"
+            log.error(msg)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=msg,
+            ) from exc
+
+    if form_data.avatar is not None and form_data.avatar.filename is not None:
+        safe_extension = validate_image_upload(form_data.avatar, label="Avatar")
+
+        user_avatar_path = fs_asset_handler.build_avatar_path(user=db_user)
+        file_name = f"avatar.{safe_extension}"
+
+        await fs_asset_handler.write_file(
+            file=form_data.avatar.file, path=user_avatar_path, filename=file_name
+        )
+        file_location = f"{user_avatar_path}/{file_name}"
+        cleaned_data["avatar_path"] = file_location
+
+    if cleaned_data:
+        # Sessions are keyed by username, so the old one is what identifies
+        # them once the update has renamed the account.
+        previous_username = db_user.username
+        creds_updated = cleaned_data.get("username") or cleaned_data.get(
+            "hashed_password"
+        )
+
+        await auth_handler.apply_user_update(
+            id,
+            cleaned_data,
+            revoke_sessions_for=previous_username if creds_updated else None,
+        )
+
+        if creds_updated and request.user.id == id:
+            request.session.clear()
+
+        # A role change alters the user's effective permissions; tell their UI.
+        if "role" in cleaned_data:
+            await emit_permissions_changed(id)
+            if cleaned_data["role"] != db_user.role:
+                await notify(
+                    id,
+                    NotificationKind.ROLE_CHANGED,
+                    NotificationLevel.INFO,
+                    {"role": cleaned_data["role"]},
+                    actor_id=request.user.id,
+                )
+
+        if cleaned_data.get("enabled") is False:
+            await close_client_token_sockets(
+                db_client_token_handler.get_token_ids_by_users([id])
+            )
+
+    before = db_user
+    db_user = db_user_handler.get_user(id)
+    if not db_user:
+        msg = f"Username with id {id} not found"
+        log.error(msg)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=msg)
+    _record_user_edit(request, before, db_user, cleaned_data)
+
+    return UserSchema.model_validate(db_user)
+
+
+@protected_route(
+    router.delete,
+    "/{id}",
+    [Scope.USERS_WRITE],
+    responses={
+        status.HTTP_400_BAD_REQUEST: {},
+        status.HTTP_404_NOT_FOUND: {},
+    },
+)
+async def delete_user(
+    request: Request,
+    id: Annotated[int, PathVar(description="User internal id.", ge=1)],
+) -> None:
+    """Delete a user by ID.
+
+    Raises:
+        HTTPException: User is not found in database
+        HTTPException: User deleting itself
+        HTTPException: User is the last admin user
+    """
+
+    user = db_user_handler.get_user(id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # You can't delete the user you're logged in as
+    if request.user.id == id:
+        raise HTTPException(status_code=400, detail="You cannot delete yourself")
+
+    # You can't delete the last admin user
+    if user.role == Role.ADMIN and len(db_user_handler.get_admin_users()) == 1:
+        raise HTTPException(
+            status_code=400, detail="You cannot delete the last admin user"
+        )
+
+    token_ids = db_client_token_handler.get_token_ids_by_users([id])
+    device_ids = [device.id for device in db_device_handler.get_devices(user_id=id)]
+    db_user_handler.delete_user(id)
+    await close_client_token_sockets(token_ids)
+    for device_id in device_ids:
+        await device_install_handler.discard_for_device(device_id)
+    record(
+        AuditAction.USER_DELETE,
+        request,
+        AuditTarget.of_user(user),
+        {"role": user.role},
+    )
+
+    # Remove the user's folder
+    user_avatar_path = fs_asset_handler.build_avatar_path(user=user)
+    try:
+        await fs_asset_handler.remove_directory(user_avatar_path)
+    except FileNotFoundError:
+        log.warning(f"Couldn't find avatar directory to delete for {user.username}")
+
+
+@protected_route(
+    router.post,
+    "/{id}/ra/refresh",
+    [Scope.ME_WRITE],
+    status_code=status.HTTP_200_OK,
+    summary="Refresh RetroAchievements",
+    responses={status.HTTP_404_NOT_FOUND: {}},
+)
+async def refresh_retro_achievements(
+    request: Request,
+    id: Annotated[int, PathVar(description="User internal id.", ge=1)],
+    incremental: Annotated[
+        bool,
+        Body(
+            description="Whether to only retrieve RetroAchievements progression incrementally.",
+            embed=True,
+        ),
+    ] = False,
+) -> None:
+    """Refresh RetroAchievements progression data for a user."""
+    # Admin users can refresh any user, while other users can only refresh self
+    if id != request.user.id and request.user.role != Role.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    user = db_user_handler.get_user(id)
+    if not user or not user.ra_username:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User does not have a RetroAchievements username set",
+        )
+
+    user_progression = await meta_ra_handler.get_user_progression(
+        user.ra_username,
+        current_progression=(
+            cast(RAUserProgression | None, user.ra_progression) if incremental else None
+        ),
+    )
+    db_user_handler.update_user(
+        id,
+        {
+            "ra_progression": user_progression,
+        },
+    )
+    return None

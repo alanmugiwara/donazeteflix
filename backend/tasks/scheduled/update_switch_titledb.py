@@ -1,0 +1,150 @@
+import json
+from itertools import batched
+from typing import Any, Final
+
+from config import (
+    ENABLE_SCHEDULED_UPDATE_SWITCH_TITLEDB,
+    SCHEDULED_UPDATE_SWITCH_TITLEDB_CRON,
+)
+from handler.dump_cache import encode
+from handler.redis_handler import async_binary_cache, async_cache
+from logger.logger import log
+from tasks.tasks import RemoteFilePullTask, TaskType
+from utils.cache import (
+    VersionedCacheStore,
+    drop_stale_cache_store,
+    stamp_cache_schema,
+)
+from utils.context import initialize_context
+
+from . import UpdateStats
+
+SWITCH_TITLEDB_INDEX_KEY: Final = "romm:switch_titledb"
+SWITCH_PRODUCT_ID_KEY: Final = "romm:switch_product_id"
+# Version 2 stores each entry compressed.
+SWITCH_TITLEDB_STORE: Final = VersionedCacheStore(
+    schema_key="romm:switch_titledb_schema",
+    version=2,
+    keys=(SWITCH_TITLEDB_INDEX_KEY, SWITCH_PRODUCT_ID_KEY),
+)
+
+
+class UpdateSwitchTitleDBTask(RemoteFilePullTask):
+    def __init__(self) -> None:
+        super().__init__(
+            title="Scheduled Switch TitleDB update",
+            description="Updates the Nintendo Switch TitleDB file",
+            task_type=TaskType.UPDATE,
+            enabled=ENABLE_SCHEDULED_UPDATE_SWITCH_TITLEDB,
+            cron_string=SCHEDULED_UPDATE_SWITCH_TITLEDB_CRON,
+            manual_run=True,
+            url="https://raw.githubusercontent.com/blawar/titledb/master/US.en.json",
+        )
+
+    @property
+    def can_run_manually(self) -> bool:
+        # The store lives only in the cache, and a rebuild that fails is not
+        # queued again, so admins need a way to fill it with the cron off.
+        return self.manual_run
+
+    @initialize_context()
+    async def run(self) -> dict[str, Any]:
+        update_stats = UpdateStats()
+
+        content = await super().run()
+
+        # An import merges into its hashes, so an older release's rows go first.
+        await drop_stale_cache_store(async_cache, SWITCH_TITLEDB_STORE)
+
+        index_json = json.loads(content)
+        relevant_data = {k: v for k, v in index_json.items() if k and v}
+        total_items = len(relevant_data)
+        processed_items = 0
+
+        # Update initial progress
+        update_stats.update(processed=processed_items, total=total_items)
+
+        async with async_binary_cache.pipeline() as pipe:
+            for data_batch in batched(relevant_data.items(), 2000, strict=False):
+                await pipe.hset(
+                    SWITCH_TITLEDB_INDEX_KEY,
+                    mapping={title_id: encode(v) for title_id, v in data_batch},
+                )
+
+                # A second copy of each entry here costs ~60MB of cache.
+                product_map = {
+                    v["id"]: encode(title_id)
+                    for title_id, v in data_batch
+                    if v.get("id")
+                }
+                if product_map:
+                    await pipe.hset(SWITCH_PRODUCT_ID_KEY, mapping=product_map)
+
+                processed_items += len(data_batch)
+                update_stats.update(processed=processed_items)
+            await pipe.execute()
+
+        await stamp_cache_schema(async_cache, SWITCH_TITLEDB_STORE)
+
+        # Final progress update
+        update_stats.update(processed=processed_items)
+        log.info("Scheduled switch titledb update completed!")
+
+        return update_stats.to_dict()
+
+
+update_switch_titledb_task = UpdateSwitchTitleDBTask()
+
+TITLEDB_REGION_LANG_MAP: Final = {
+    "BG": ["en"],
+    "BR": ["en", "pt"],
+    "CH": ["fr", "de", "it"],
+    "CY": ["en"],
+    "EE": ["en"],
+    "HR": ["en"],
+    "IE": ["en"],
+    "LT": ["en"],
+    "LU": ["fr", "de"],
+    "LV": ["en"],
+    "MT": ["en"],
+    "RO": ["en"],
+    "SI": ["en"],
+    "SK": ["en"],
+    "CO": ["en", "es"],
+    "AR": ["en", "es"],
+    "CL": ["en", "es"],
+    "PE": ["en", "es"],
+    "KR": ["ko"],
+    "HK": ["zh"],
+    "CN": ["zh"],
+    "NZ": ["en"],
+    "AT": ["de"],
+    "BE": ["fr", "nl"],
+    "CZ": ["en"],
+    "DK": ["en"],
+    "ES": ["es"],
+    "FI": ["en"],
+    "GR": ["en"],
+    "HU": ["en"],
+    "NL": ["nl"],
+    "NO": ["en"],
+    "PL": ["en"],
+    "PT": ["pt"],
+    "RU": ["ru"],
+    "ZA": ["en"],
+    "SE": ["en"],
+    "MX": ["en", "es"],
+    "IT": ["it"],
+    "CA": ["en", "fr"],
+    "FR": ["fr"],
+    "DE": ["de"],
+    "JP": ["ja"],
+    "AU": ["en"],
+    "GB": ["en"],
+    "US": ["en", "es"],
+}
+
+TITLEDB_REGION_LIST: Final = list(TITLEDB_REGION_LANG_MAP.keys())
+TITLEDB_LANGUAGE_LIST: Final = list(
+    set(lang for sublist in TITLEDB_REGION_LANG_MAP.values() for lang in sublist)
+)

@@ -1,0 +1,34 @@
+"""Track user last login and active times
+
+Revision ID: 0016_user_last_login_active
+Revises: 0015_mobygames_data
+Create Date: 2024-04-06 15:16:50.539968
+
+"""
+
+import sqlalchemy as sa
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision = "0016_user_last_login_active"
+down_revision = "0015_mobygames_data"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    with op.batch_alter_table("users", schema=None) as batch_op:
+        batch_op.add_column(
+            sa.Column("last_login", sa.DateTime(timezone=True), nullable=True),
+            if_not_exists=True,
+        )
+        batch_op.add_column(
+            sa.Column("last_active", sa.DateTime(timezone=True), nullable=True),
+            if_not_exists=True,
+        )
+
+
+def downgrade() -> None:
+    with op.batch_alter_table("users", schema=None) as batch_op:
+        batch_op.drop_column("last_active", if_exists=True)
+        batch_op.drop_column("last_login", if_exists=True)

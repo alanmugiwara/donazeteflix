@@ -1,0 +1,157 @@
+import errno
+import os
+import re
+import shutil
+from collections.abc import Iterator
+from pathlib import Path
+
+# Container file extensions treated as compressed archives across modules
+# (roms_handler for hashing decisions, rahasher for skipping disc-platform
+# buffer-hash attempts, feeds for PKGi passthrough).
+COMPRESSED_FILE_EXTENSIONS: frozenset[str] = frozenset(
+    (".7z", ".bz2", ".gz", ".rar", ".tar", ".zip", ".xz", ".tgz", ".tbz2", ".txz")
+)
+
+# str.endswith takes a tuple, never a set, so it is built once here.
+COMPRESSED_FILE_SUFFIXES: tuple[str, ...] = tuple(COMPRESSED_FILE_EXTENSIONS)
+
+# tempfile.mkstemp creates files 0600, too narrow for the nginx user to read.
+SERVED_FILE_MODE = 0o644
+
+
+def iter_files(path: str, recursive: bool = False) -> Iterator[tuple[Path, str]]:
+    """List files in a directory.
+
+    Yields tuples where the first element is the path to the directory where the file is located,
+    and the second element is the name of the file.
+    """
+    for root, _, files in os.walk(path, topdown=True):
+        for file in files:
+            yield Path(root), file
+        if not recursive:
+            break
+
+
+def iter_directories(path: str, recursive: bool = False) -> Iterator[tuple[Path, str]]:
+    """List directories in a directory.
+
+    Yields tuples where the first element is the path to the directory where the directory is located,
+    and the second element is the name of the directory.
+    """
+    for root, dirs, _ in os.walk(path, topdown=True):
+        for directory in dirs:
+            yield Path(root), directory
+        if not recursive:
+            break
+
+
+# errno values that mean "hardlink not possible here, fall back to copy".
+# EXDEV: cross-device link. EPERM: filesystem doesn't permit/support hardlinks
+# (e.g. FAT32, exFAT, some network mounts). EOPNOTSUPP/ENOTSUP: same, on BSD/macOS.
+# EMLINK: source already has the maximum number of hardlinks for the filesystem.
+LINK_FALLBACK_ERRNOS: frozenset[int] = frozenset(
+    e
+    for e in (
+        getattr(errno, "EXDEV", None),
+        getattr(errno, "EPERM", None),
+        getattr(errno, "EOPNOTSUPP", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EMLINK", None),
+        getattr(errno, "EACCES", None),
+    )
+    if e is not None
+)
+
+
+def rel_platform_folder(fs_path: str, platform_fs_path: str) -> str:
+    """The part of a rom's folder that sits below its platform folder.
+
+    Args:
+        fs_path: The rom's folder.
+        platform_fs_path: The platform folder holding the metadata export files.
+    Returns:
+        `Disks/Set A` for a rom nested by a custom library structure, empty for one
+        sitting directly in the platform folder.
+    """
+    rel = fs_path.removeprefix(f"{platform_fs_path}/")
+    return "" if rel in (fs_path, platform_fs_path) else rel
+
+
+def join_rel_path(*parts: str) -> str:
+    """Join the non-empty parts of a path written into an export file."""
+    return "/".join(part for part in parts if part)
+
+
+def link_or_copy_file(source: Path, dest: Path) -> None:
+    """Place ``source`` at ``dest`` via hardlink (preferred) or copy (fallback),
+    atomically replacing ``dest`` if it already exists. Caller is responsible
+    for creating ``dest.parent``.
+
+    Hardlinking is preferred because it's instantaneous and uses no extra disk
+    space, but only works within a single filesystem. If linking isn't possible,
+    we transparently fall back to ``shutil.copy2`` (preserving metadata).
+
+    Overwriting is atomic: we link/copy to a tempfile in dest's directory, then
+    rename it onto dest, which mirrors shutil.copy2's overwrite-on-exists
+    behavior.
+    """
+    tmp_path = dest.parent / f".romm_link_tmp_{os.urandom(8).hex()}"
+    try:
+        try:
+            os.link(source, tmp_path)
+        except OSError as exc:
+            if exc.errno not in LINK_FALLBACK_ERRNOS:
+                raise
+            shutil.copy2(source, tmp_path)
+        os.replace(tmp_path, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+INVALID_CHARS_HYPHENS = re.compile(r"[\\/:|]")
+INVALID_CHARS_EMPTY = re.compile(r'[*?"<>]')
+
+# C0 controls plus DEL. Illegal on most filesystems, and a line feed in a name
+# that reaches a line-oriented protocol (the nginx mod_zip manifest) would split
+# the record it sits in.
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def sanitize_filename(filename: str) -> str:
+    """
+    Replace invalid characters in the filename to make it valid across common filesystems
+    and prevent path-traversal attacks.
+
+    Args:
+    - filename (str): The filename to sanitize.
+
+    Returns:
+    - str: The sanitized filename (always a bare name, never a path).
+
+    Raises:
+    - ValueError: If the filename is empty or a reserved traversal name.
+    """
+    # Strip directory components first to neutralise path-traversal payloads
+    sanitized_filename = os.path.basename(filename)
+
+    # Replace some invalid characters with hyphen
+    sanitized_filename = INVALID_CHARS_HYPHENS.sub("-", sanitized_filename)
+
+    # Remove other invalid characters
+    sanitized_filename = INVALID_CHARS_EMPTY.sub("", sanitized_filename)
+
+    # Drop control characters, null bytes included (ZFS allows every other character)
+    sanitized_filename = CONTROL_CHARS.sub("", sanitized_filename)
+
+    # Remove leading/trailing whitespace
+    sanitized_filename = sanitized_filename.strip()
+
+    # Reject empty, current-directory, or parent-directory names
+    if not sanitized_filename or sanitized_filename in (".", ".."):
+        raise ValueError("Filename cannot be empty after sanitization")
+
+    return sanitized_filename

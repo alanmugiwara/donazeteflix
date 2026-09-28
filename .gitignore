@@ -1,0 +1,102 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+.DS_Store
+dist
+dist-ssr
+coverage
+*.local
+
+/cypress/videos/
+/cypress/screenshots/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+.zed/*
+!.zed/settings.json
+pyrightconfig.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# pycache
+__pycache__
+
+# secrets
+.env
+
+# database
+mariadb
+*.sqlite
+
+# used to mock the library/config/mounts/etc while testing
+frontend/assets/romm
+romm_mock
+
+# emulator runtimes, linked in from the dev image by entrypoint.sh
+frontend/assets/emulatorjs/*
+!frontend/assets/emulatorjs/*.svg
+frontend/assets/ruffle/*
+!frontend/assets/ruffle/*.svg
+!frontend/assets/ruffle/*.png
+frontend/assets/jsdos
+frontend/assets/pico8
+
+# virtualenv
+.venv
+
+# testing
+backend/romm_test/resources
+backend/romm_test/logs
+backend/romm_test/assets
+backend/romm_test/retroarch_sync
+backend/romm_test/cache/retroarch_sync
+.pytest_cache
+.hypothesis
+/romm_test
+.coverage
+pytest-report.xml
+coverage.xml
+
+# service worker
+frontend/dev-dist
+
+# storybook
+frontend/storybook-static
+
+# outside data
+switch_titledb.json
+switch_product_ids.json
+
+# AI tools
+# Keep shared agent skills tracked; ignore personal/local Claude config.
+.claude/*
+!.claude/skills/
+!.claude/hooks/
+!.claude/settings.json
+
+# Local dev scripts
+/dev.sh
+
+# Playwright (e2e) artifacts
+frontend/playwright/.auth/
+frontend/test-results/
+frontend/playwright-report/
+frontend/blob-report/
+frontend/.last-run.json
+
+# mypy
+.mypy_cache

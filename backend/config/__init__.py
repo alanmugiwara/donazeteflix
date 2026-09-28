@@ -1,0 +1,442 @@
+import json
+import os
+from pathlib import Path
+from typing import Final, overload
+
+import yarl
+from dotenv import load_dotenv
+
+from utils.database import safe_int, safe_str_to_bool
+
+load_dotenv()
+
+
+# Supplying a string literal for fallback guarantees a `str` result
+@overload
+def _get_env(var: str, fallback: str) -> str: ...
+@overload
+def _get_env(var: str, fallback: None = None) -> str | None: ...
+
+
+def _get_env(var: str, fallback: str | None = None) -> str | None:
+    val = os.environ.get(var) or fallback
+    return val.strip() if val else val
+
+
+ROMM_BASE_URL: Final[str] = _get_env("ROMM_BASE_URL", "http://0.0.0.0")
+ROMM_PORT: Final[int] = safe_int(_get_env("ROMM_PORT"), 8080)
+
+# GUNICORN
+DEV_MODE: Final[bool] = safe_str_to_bool(_get_env("DEV_MODE"))
+DEV_HOST: Final[str] = _get_env("DEV_HOST", "127.0.0.1")
+DEV_PORT: Final[int] = safe_int(_get_env("DEV_PORT"), 5000)
+DEV_SQL_ECHO: Final[bool] = safe_str_to_bool(_get_env("DEV_SQL_ECHO"))
+
+# PATHS
+ROMM_BASE_PATH: Final[str] = _get_env("ROMM_BASE_PATH", "/romm")
+ROMM_TMP_PATH: Final[str | None] = _get_env("ROMM_TMP_PATH")
+LIBRARY_BASE_PATH: Final[str] = f"{ROMM_BASE_PATH}/library"
+RESOURCES_BASE_PATH: Final[str] = f"{ROMM_BASE_PATH}/resources"
+ASSETS_BASE_PATH: Final[str] = f"{ROMM_BASE_PATH}/assets"
+ZIP_CACHE_PATH: Final[str] = f"{ROMM_BASE_PATH}/cache/zips"
+FRONTEND_RESOURCES_PATH: Final[str] = "/assets/romm/resources"
+
+# ROM UPLOADS
+# Chunked upload parts are staged on disk, under RESOURCES_BASE_PATH by default.
+ROM_UPLOAD_TMP_BASE: Final[Path] = (
+    Path(ROMM_TMP_PATH) if ROMM_TMP_PATH else Path(RESOURCES_BASE_PATH)
+) / "tmp/uploads"
+ROM_UPLOAD_TTL: Final[int] = 86400  # 24 hours
+# Extension of the half-written file an upload assembles into. Excluded from
+# scans by DEFAULT_EXCLUDED_EXTENSIONS, so the two must agree.
+ROM_UPLOAD_ASSEMBLING_EXT: Final[str] = "assembling"
+
+# SEVEN ZIP
+SEVEN_ZIP_TIMEOUT: Final[int] = safe_int(_get_env("SEVEN_ZIP_TIMEOUT"), 180)
+
+# ROM PATCHER
+ROM_PATCHER_TIMEOUT: Final[int] = safe_int(_get_env("ROM_PATCHER_TIMEOUT"), 120)
+# RomPatcher.js loads the whole ROM into memory in Node, so cap inputs to avoid OOM.
+ROM_PATCHER_MAX_FILE_SIZE_BYTES: Final[int] = safe_int(
+    _get_env("ROM_PATCHER_MAX_FILE_SIZE_BYTES"), 4 * 1024 * 1024 * 1024  # 4 GiB
+)
+# Limit concurrent patch subprocesses to bound total memory use.
+ROM_PATCHER_MAX_CONCURRENCY: Final[int] = max(
+    1, safe_int(_get_env("ROM_PATCHER_MAX_CONCURRENCY"), 2)
+)
+
+# DATABASE
+DB_HOST: Final[str | None] = _get_env("DB_HOST")
+DB_PORT: Final[int] = safe_int(_get_env("DB_PORT"), 3306)
+DB_USER: Final[str | None] = _get_env("DB_USER")
+DB_PASSWD: Final[str | None] = _get_env("DB_PASSWD")
+DB_NAME: Final[str] = _get_env("DB_NAME", "romm")
+DB_QUERY_JSON: Final[str | None] = _get_env("DB_QUERY_JSON")
+ROMM_DB_DRIVER: Final[str] = _get_env("ROMM_DB_DRIVER", "mariadb")
+# Kept under the idle `wait_timeout` a host may impose; -1 never recycles.
+DB_POOL_RECYCLE_SECONDS: Final[int] = safe_int(_get_env("DB_POOL_RECYCLE_SECONDS"), 300)
+
+# REDIS
+REDIS_HOST: Final[str | None] = _get_env("REDIS_HOST")
+REDIS_PORT: Final[int] = safe_int(_get_env("REDIS_PORT"), 6379)
+REDIS_PASSWORD: Final[str | None] = _get_env("REDIS_PASSWORD")
+REDIS_USERNAME: Final[str | None] = _get_env("REDIS_USERNAME")
+REDIS_DB: Final[int] = safe_int(_get_env("REDIS_DB"), 0)
+REDIS_SSL: Final[bool] = safe_str_to_bool(_get_env("REDIS_SSL"))
+REDIS_URL: Final[str] = str(
+    yarl.URL.build(
+        scheme="rediss" if REDIS_SSL else "redis",
+        user=REDIS_USERNAME or None,
+        password=REDIS_PASSWORD or None,
+        host=REDIS_HOST or "127.0.0.1",
+        port=REDIS_PORT,
+        path=f"/{REDIS_DB}",
+    )
+)
+
+# IGDB
+IGDB_CLIENT_ID: Final[str | None] = _get_env("IGDB_CLIENT_ID")
+IGDB_CLIENT_SECRET: Final[str | None] = _get_env("IGDB_CLIENT_SECRET")
+
+# MOBYGAMES
+MOBYGAMES_API_KEY: Final[str | None] = _get_env("MOBYGAMES_API_KEY")
+
+# SCREENSCRAPER
+SCREENSCRAPER_USER: Final[str | None] = _get_env("SCREENSCRAPER_USER")
+SCREENSCRAPER_PASSWORD: Final[str | None] = _get_env("SCREENSCRAPER_PASSWORD")
+# Developer credentials, injected at build time.
+SCREENSCRAPER_DEV_ID: Final[str | None] = _get_env("SCREENSCRAPER_DEV_ID")
+SCREENSCRAPER_DEV_PASSWORD: Final[str | None] = _get_env("SCREENSCRAPER_DEV_PASSWORD")
+
+# STEAMGRIDDB
+STEAMGRIDDB_API_KEY: Final[str | None] = _get_env("STEAMGRIDDB_API_KEY")
+
+# RETROACHIEVEMENTS
+RETROACHIEVEMENTS_API_KEY: Final[str | None] = _get_env("RETROACHIEVEMENTS_API_KEY")
+REFRESH_RETROACHIEVEMENTS_CACHE_DAYS: Final[int] = safe_int(
+    _get_env("REFRESH_RETROACHIEVEMENTS_CACHE_DAYS"), 30
+)
+
+# LAUNCHBOX
+LAUNCHBOX_BASE_PATH: Final[str] = f"{ROMM_BASE_PATH}/launchbox"
+LAUNCHBOX_API_ENABLED: Final[bool] = safe_str_to_bool(_get_env("LAUNCHBOX_API_ENABLED"))
+
+# PLAYMATCH
+PLAYMATCH_API_ENABLED: Final[bool] = safe_str_to_bool(_get_env("PLAYMATCH_API_ENABLED"))
+# Base URL of the Playmatch API, overridable to point at a self-hosted instance.
+PLAYMATCH_API_URL: Final[str] = _get_env(
+    "PLAYMATCH_API_URL", "https://playmatch.retrorealm.dev/api/v2"
+).rstrip("/")
+
+# HASHEOUS
+HASHEOUS_API_ENABLED: Final[bool] = safe_str_to_bool(_get_env("HASHEOUS_API_ENABLED"))
+# Base URL of the Hasheous API, overridable to point at a self-hosted instance.
+HASHEOUS_API_URL: Final[str] = _get_env(
+    "HASHEOUS_API_URL",
+    "https://beta.hasheous.org/api/v1" if DEV_MODE else "https://hasheous.org/api/v1",
+).rstrip("/")
+
+# THEGAMESDB
+TGDB_API_ENABLED: Final[bool] = safe_str_to_bool(_get_env("TGDB_API_ENABLED"))
+
+# FLASHPOINT
+FLASHPOINT_API_ENABLED: Final[bool] = safe_str_to_bool(
+    _get_env("FLASHPOINT_API_ENABLED")
+)
+
+# HOWLONGTOBEAT
+HLTB_API_ENABLED: Final[bool] = safe_str_to_bool(_get_env("HLTB_API_ENABLED"))
+
+# DEMOZOO / POUET (public JSON, no API key)
+DEMOZOO_API_ENABLED: Final[bool] = safe_str_to_bool(_get_env("DEMOZOO_API_ENABLED"))
+POUET_API_ENABLED: Final[bool] = safe_str_to_bool(_get_env("POUET_API_ENABLED"))
+# CSDb XML webservice, C64 stills
+CSDB_API_ENABLED: Final[bool] = safe_str_to_bool(_get_env("CSDB_API_ENABLED"))
+
+# STEAM
+STEAM_API_ENABLED: Final[bool] = safe_str_to_bool(_get_env("STEAM_API_ENABLED"))
+
+# UPC LOOKUP (barcode -> title, used when adding physical games by UPC)
+UPC_LOOKUP_ENABLED: Final[bool] = safe_str_to_bool(
+    _get_env("UPC_LOOKUP_ENABLED", "true")
+)
+UPC_LOOKUP_API_KEY: Final[str | None] = _get_env("UPC_LOOKUP_API_KEY")
+UPC_LOOKUP_URL: Final[str] = _get_env(
+    "UPC_LOOKUP_URL", "https://api.upcitemdb.com/prod/trial/lookup"
+)
+
+# AUTH
+ROMM_AUTH_SECRET_KEY: Final[str] = _get_env("ROMM_AUTH_SECRET_KEY", "")
+if not ROMM_AUTH_SECRET_KEY:
+    raise ValueError("ROMM_AUTH_SECRET_KEY environment variable is not set!")
+
+OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS: Final[int] = safe_int(
+    _get_env("OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS"), 30 * 60
+)  # 30 minutes, in seconds
+
+OAUTH_REFRESH_TOKEN_EXPIRE_SECONDS: Final[int] = safe_int(
+    _get_env("OAUTH_REFRESH_TOKEN_EXPIRE_SECONDS"), 7 * 24 * 60 * 60
+)  # 7 days, in seconds
+
+SESSION_MAX_AGE_SECONDS: Final[int] = safe_int(
+    _get_env("SESSION_MAX_AGE_SECONDS"), 14 * 24 * 60 * 60
+)  # 14 days, in seconds
+DISABLE_CSRF_PROTECTION: Final[bool] = safe_str_to_bool(
+    _get_env("DISABLE_CSRF_PROTECTION")
+)
+DISABLE_DOWNLOAD_ENDPOINT_AUTH: Final[bool] = safe_str_to_bool(
+    _get_env("DISABLE_DOWNLOAD_ENDPOINT_AUTH")
+)
+DISABLE_USERPASS_LOGIN: Final[bool] = safe_str_to_bool(
+    _get_env("DISABLE_USERPASS_LOGIN")
+)
+
+# EMAIL, for notification channels and password reset links; off until a host and a sender are set
+SMTP_HOST: Final[str] = _get_env("SMTP_HOST", "")
+SMTP_PORT: Final[int] = safe_int(_get_env("SMTP_PORT"), 587)
+SMTP_USERNAME: Final[str] = _get_env("SMTP_USERNAME", "")
+SMTP_PASSWORD: Final[str] = _get_env("SMTP_PASSWORD", "")
+SMTP_FROM: Final[str] = _get_env("SMTP_FROM", "")
+# `tls` is implicit TLS, usually on port 465; any other value leaves email off.
+SMTP_SECURITY_MODES: Final = ("starttls", "tls", "none")
+SMTP_SECURITY: Final[str] = _get_env("SMTP_SECURITY", "starttls").strip().lower()
+EMAIL_ENABLED: Final[bool] = bool(
+    SMTP_HOST and SMTP_FROM and SMTP_SECURITY in SMTP_SECURITY_MODES
+)
+
+ROMM_CORS_ALLOWED_ORIGINS: Final[list[str]] = [
+    o.strip()
+    for o in (_get_env("ROMM_CORS_ALLOWED_ORIGINS") or "").split(",")
+    if o.strip()
+]
+
+
+def cors_allow_credentials(origins: list[str]) -> bool:
+    """A wildcard origin carries no credentials, since it echoes any caller's."""
+    return "*" not in origins
+
+
+ROMM_SESSION_SECURE_COOKIE: Final[bool] = safe_str_to_bool(
+    _get_env("ROMM_SESSION_SECURE_COOKIE")
+)
+
+DISABLE_SETUP_WIZARD: Final[bool] = safe_str_to_bool(_get_env("DISABLE_SETUP_WIZARD"))
+INVITE_TOKEN_EXPIRY_SECONDS: Final[int] = safe_int(
+    _get_env("INVITE_TOKEN_EXPIRY_SECONDS"), 10 * 60
+)
+
+# OIDC
+OIDC_ENABLED: Final[bool] = safe_str_to_bool(_get_env("OIDC_ENABLED"))
+OIDC_AUTOLOGIN: Final[bool] = safe_str_to_bool(_get_env("OIDC_AUTOLOGIN"))
+OIDC_ALLOW_REGISTRATION: Final[bool] = safe_str_to_bool(
+    _get_env("OIDC_ALLOW_REGISTRATION", "true")
+)
+OIDC_PROVIDER: Final[str] = _get_env("OIDC_PROVIDER", "")
+OIDC_CLIENT_ID: Final[str] = _get_env("OIDC_CLIENT_ID", "")
+OIDC_CLIENT_SECRET: Final[str] = _get_env("OIDC_CLIENT_SECRET", "")
+OIDC_REDIRECT_URI: Final[str] = _get_env("OIDC_REDIRECT_URI", "")
+OIDC_SERVER_APPLICATION_URL: Final[str] = _get_env("OIDC_SERVER_APPLICATION_URL", "")
+OIDC_SERVER_METADATA_URL: Final[str | None] = _get_env("OIDC_SERVER_METADATA_URL")
+OIDC_CLAIM_ROLES: Final[str] = _get_env("OIDC_CLAIM_ROLES", "")
+OIDC_ROLE_VIEWER: Final[str | None] = _get_env("OIDC_ROLE_VIEWER")
+OIDC_ROLE_EDITOR: Final[str | None] = _get_env("OIDC_ROLE_EDITOR")
+OIDC_ROLE_ADMIN: Final[str | None] = _get_env("OIDC_ROLE_ADMIN")
+OIDC_TLS_CACERTFILE: Final[str | None] = _get_env("OIDC_TLS_CACERTFILE")
+OIDC_USERNAME_ATTRIBUTE: Final[str] = _get_env(
+    "OIDC_USERNAME_ATTRIBUTE", "preferred_username"
+)
+OIDC_RP_INITIATED_LOGOUT: Final[bool] = safe_str_to_bool(
+    _get_env("OIDC_RP_INITIATED_LOGOUT")
+)
+OIDC_END_SESSION_ENDPOINT: Final[str] = _get_env("OIDC_END_SESSION_ENDPOINT", "")
+
+# SCANS
+SCAN_TIMEOUT: Final[int] = safe_int(_get_env("SCAN_TIMEOUT"), 60 * 60 * 4)  # 4 hours
+SCAN_WORKERS: Final[int] = max(1, safe_int(_get_env("SCAN_WORKERS"), 4))
+
+# TASKS
+TASK_TIMEOUT: Final[int] = safe_int(_get_env("TASK_TIMEOUT"), 60 * 5)  # 5 minutes
+TASK_RESULT_TTL: Final[int] = safe_int(
+    _get_env("TASK_RESULT_TTL"), 24 * 60 * 60
+)  # 24 hours
+ENABLE_RESCAN_ON_FILESYSTEM_CHANGE: Final[bool] = safe_str_to_bool(
+    _get_env("ENABLE_RESCAN_ON_FILESYSTEM_CHANGE")
+)
+RESCAN_ON_FILESYSTEM_CHANGE_DELAY: Final[int] = safe_int(
+    _get_env("RESCAN_ON_FILESYSTEM_CHANGE_DELAY"),
+    5,  # 5 minutes
+)
+ENABLE_SCHEDULED_RESCAN: Final[bool] = safe_str_to_bool(
+    _get_env("ENABLE_SCHEDULED_RESCAN")
+)
+SCHEDULED_RESCAN_CRON: Final[str] = _get_env(
+    "SCHEDULED_RESCAN_CRON",
+    "0 3 * * *",  # At 3:00 AM every day
+)
+ENABLE_SCHEDULED_UPDATE_SWITCH_TITLEDB: Final[bool] = safe_str_to_bool(
+    _get_env("ENABLE_SCHEDULED_UPDATE_SWITCH_TITLEDB")
+)
+SCHEDULED_UPDATE_SWITCH_TITLEDB_CRON: Final[str] = _get_env(
+    "SCHEDULED_UPDATE_SWITCH_TITLEDB_CRON",
+    "0 4 * * *",  # At 4:00 AM every day
+)
+ENABLE_SCHEDULED_UPDATE_LAUNCHBOX_METADATA: Final[bool] = safe_str_to_bool(
+    _get_env("ENABLE_SCHEDULED_UPDATE_LAUNCHBOX_METADATA")
+)
+SCHEDULED_UPDATE_LAUNCHBOX_METADATA_CRON: Final[str] = _get_env(
+    "SCHEDULED_UPDATE_LAUNCHBOX_METADATA_CRON",
+    "0 4 * * *",  # At 4:00 AM every day
+)
+ENABLE_SCHEDULED_CONVERT_IMAGES_TO_WEBP: Final[bool] = safe_str_to_bool(
+    _get_env("ENABLE_SCHEDULED_CONVERT_IMAGES_TO_WEBP")
+)
+SCHEDULED_CONVERT_IMAGES_TO_WEBP_CRON: Final[str] = _get_env(
+    "SCHEDULED_CONVERT_IMAGES_TO_WEBP_CRON",
+    "0 4 * * *",  # At 4:00 AM every day
+)
+ENABLE_SCHEDULED_CLEANUP_ORPHANED_RESOURCES: Final[bool] = safe_str_to_bool(
+    _get_env("ENABLE_SCHEDULED_CLEANUP_ORPHANED_RESOURCES")
+)
+SCHEDULED_CLEANUP_ORPHANED_RESOURCES_CRON: Final[str] = _get_env(
+    "SCHEDULED_CLEANUP_ORPHANED_RESOURCES_CRON",
+    "0 5 * * *",  # At 5:00 AM every day, after the nightly scan and metadata tasks
+)
+ENABLE_SCHEDULED_RETROACHIEVEMENTS_PROGRESS_SYNC: Final[bool] = safe_str_to_bool(
+    _get_env("ENABLE_SCHEDULED_RETROACHIEVEMENTS_PROGRESS_SYNC")
+)
+SCHEDULED_RETROACHIEVEMENTS_PROGRESS_SYNC_CRON: Final[str] = _get_env(
+    "SCHEDULED_RETROACHIEVEMENTS_PROGRESS_SYNC_CRON",
+    "0 4 * * *",  # At 4:00 AM every day
+)
+# On by default: the similarity index is what both the "Similar games" section
+# and the personalised feed read, so leaving it off silently empties them.
+ENABLE_SCHEDULED_BUILD_RECOMMENDATIONS: Final[bool] = safe_str_to_bool(
+    _get_env("ENABLE_SCHEDULED_BUILD_RECOMMENDATIONS", "true")
+)
+SCHEDULED_BUILD_RECOMMENDATIONS_CRON: Final[str] = _get_env(
+    "SCHEDULED_BUILD_RECOMMENDATIONS_CRON",
+    "30 5 * * *",  # At 5:30 AM every day, after the nightly scan and metadata tasks
+)
+
+# AUDIT LOG
+# Days an audit event is kept; 0 keeps every event.
+AUDIT_LOG_RETENTION_DAYS: Final[int] = safe_int(
+    _get_env("AUDIT_LOG_RETENTION_DAYS"), 90
+)
+
+# SYNC
+SYNC_BASE_PATH: Final[str] = f"{ROMM_BASE_PATH}/sync"
+ENABLE_SYNC_FOLDER_WATCHER: Final[bool] = safe_str_to_bool(
+    _get_env("ENABLE_SYNC_FOLDER_WATCHER")
+)
+SYNC_FOLDER_SCAN_DELAY: Final[int] = safe_int(
+    _get_env("SYNC_FOLDER_SCAN_DELAY"), 2  # 2 minutes
+)
+ENABLE_SYNC_PUSH_PULL: Final[bool] = safe_str_to_bool(_get_env("ENABLE_SYNC_PUSH_PULL"))
+SYNC_PUSH_PULL_CRON: Final[str] = _get_env(
+    "SYNC_PUSH_PULL_CRON",
+    "*/30 * * * *",  # Every 30 minutes
+)
+SYNC_SSH_KEYS_PATH: Final[str] = _get_env(
+    "SYNC_SSH_KEYS_PATH", f"{SYNC_BASE_PATH}/keys"
+)
+SYNC_SSH_KNOWN_HOSTS_PATH: Final[str] = _get_env(
+    "SYNC_SSH_KNOWN_HOSTS_PATH", f"{SYNC_BASE_PATH}/known_hosts"
+)
+# RetroArch Cloud Sync's config/, thumbnails/ and system/ files, which no ROM owns.
+SYNC_RETROARCH_BASE_PATH: Final[str] = f"{ROMM_BASE_PATH}/retroarch_sync"
+# PSP save folder files buffered until the folder resolves to a rom.
+SYNC_RETROARCH_PSP_PENDING_PATH: Final[str] = f"{ROMM_BASE_PATH}/cache/retroarch_sync"
+# JSON map of PSP serial to extensionless rom file name, for saves whose title
+# matches no rom, e.g. {"ULUS10336": "Crisis Core - Final Fantasy VII (USA)"}.
+SYNC_RETROARCH_PSP_SERIAL_MAP: Final[dict[str, str]] = json.loads(
+    _get_env("SYNC_RETROARCH_PSP_SERIAL_MAP", "{}")
+)
+
+# DEVICE INSTALL
+DEVICE_INSTALL_ENABLED: Final[bool] = safe_str_to_bool(
+    _get_env("DEVICE_INSTALL_ENABLED", "true")
+)
+# Days an unfinished install request lives after its last change; 0 or less never expires.
+DEVICE_INSTALL_REQUEST_TTL_DAYS: Final[int] = safe_int(
+    _get_env("DEVICE_INSTALL_REQUEST_TTL_DAYS"), 2
+)
+# Platforms whose roms cannot be pushed to a device for install.
+DEVICE_INSTALL_EXCLUDED_PLATFORM_SLUGS: Final[frozenset[str]] = frozenset(
+    slug.strip().lower()
+    for slug in _get_env(
+        "DEVICE_INSTALL_EXCLUDED_PLATFORM_SLUGS", "win,win3x,win9x,windows-apps"
+    ).split(",")
+    if slug.strip()
+)
+
+# EMULATION
+DISABLE_EMULATOR_JS: Final[bool] = safe_str_to_bool(_get_env("DISABLE_EMULATOR_JS"))
+DISABLE_RUFFLE_RS: Final[bool] = safe_str_to_bool(_get_env("DISABLE_RUFFLE_RS"))
+DISABLE_JSDOS: Final[bool] = safe_str_to_bool(_get_env("DISABLE_JSDOS"))
+DISABLE_PICO8: Final[bool] = safe_str_to_bool(_get_env("DISABLE_PICO8"))
+
+# FRONTEND
+KIOSK_MODE: Final[bool] = safe_str_to_bool(_get_env("KIOSK_MODE"))
+DISABLE_LOGS_VIEWER: Final[bool] = safe_str_to_bool(_get_env("DISABLE_LOGS_VIEWER"))
+
+# ASSETS
+MAX_ASSET_UPLOAD_SIZE_BYTES: Final[int] = safe_int(
+    _get_env("MAX_ASSET_UPLOAD_SIZE_BYTES"), 512 * 1024 * 1024  # 512 MiB
+)
+MAX_AUTOCLEANUP_LIMIT: Final[int] = max(
+    1, safe_int(_get_env("MAX_AUTOCLEANUP_LIMIT"), 100)
+)
+# Versions the server keeps per save slot whatever the client asks; 0 disables.
+MAX_SAVES_PER_SLOT: Final[int] = max(0, safe_int(_get_env("MAX_SAVES_PER_SLOT"), 50))
+
+# LOGGING
+LOGLEVEL: Final[str] = _get_env("LOGLEVEL", "INFO").upper()
+FORCE_COLOR: Final[bool] = safe_str_to_bool(_get_env("FORCE_COLOR"))
+NO_COLOR: Final[bool] = safe_str_to_bool(_get_env("NO_COLOR"))
+
+# YOUTUBE
+YOUTUBE_BASE_URL: Final[str] = _get_env(
+    "YOUTUBE_BASE_URL", "https://www.youtube.com"
+).rstrip("/")
+
+# TINFOIL
+TINFOIL_WELCOME_MESSAGE: Final[str] = _get_env(
+    "TINFOIL_WELCOME_MESSAGE", "RomM Switch Library"
+)
+
+# EMULATOR STREAMING
+STREAMING_BROKER_SECRET: Final[str] = _get_env("STREAMING_BROKER_SECRET", "")
+STREAMING_SAVE_TIMEOUT: Final[int] = safe_int(
+    _get_env("STREAMING_SAVE_TIMEOUT"), 45
+)  # 45 seconds
+# Seconds a webstation activate may take. The broker unpacks pkg and archive
+# ROMs before it can start the emulator, so this has to outlast the slowest
+# extraction rather than just a process spawn.
+STREAMING_LAUNCH_TIMEOUT: Final[int] = safe_int(
+    _get_env("STREAMING_LAUNCH_TIMEOUT"), 600
+)  # 10 minutes
+# How many save states to keep per ROM, emulator and user. Each capture is
+# kept as its own asset rather than overwriting a slot, so the oldest are
+# pruned once this many exist. 0 disables pruning.
+STREAMING_STATE_HISTORY_LIMIT: Final[int] = safe_int(
+    _get_env("STREAMING_STATE_HISTORY_LIMIT"), 50
+)
+
+# SENTRY
+SENTRY_DSN: Final[str | None] = _get_env("SENTRY_DSN")
+
+# TESTING
+IS_PYTEST_RUN: Final = bool(_get_env("PYTEST_VERSION"))
+
+
+# PROXY
+def has_proxy_env() -> bool:
+    return any(
+        _get_env(var)
+        for var in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+        )
+    )

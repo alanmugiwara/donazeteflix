@@ -1,0 +1,36 @@
+"""Increase length of file_extension column
+
+Revision ID: 0013_upgrade_file_extension
+Revises: 0012_add_regions_languages
+Create Date: 2024-01-02 16:51:20.485746
+
+"""
+
+import sqlalchemy as sa
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision = "0013_upgrade_file_extension"
+down_revision = "0012_add_regions_languages"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    with op.batch_alter_table("roms", schema=None) as batch_op:
+        batch_op.alter_column(
+            "file_extension",
+            type_=sa.String(length=100),
+            existing_type=sa.String(length=10),
+            nullable=False,
+        )
+
+
+def downgrade() -> None:
+    with op.batch_alter_table("roms", schema=None) as batch_op:
+        batch_op.alter_column(
+            "file_extension",
+            type_=sa.String(length=10),
+            existing_type=sa.String(length=100),
+            nullable=False,
+        )

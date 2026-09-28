@@ -1,0 +1,190 @@
+import axios from "axios";
+import { default as Cookies } from "js-cookie";
+import { debounce } from "lodash";
+import { isAuthExemptRoute, ROUTES } from "@/plugins/routeNames";
+
+const api = axios.create({
+  // This will keep the url query params on refresh
+  baseURL: "/api",
+  timeout: 120000,
+  paramsSerializer: {
+    serialize: (params) => {
+      const searchParams = new URLSearchParams();
+
+      Object.keys(params).forEach((key) => {
+        const value = params[key];
+        if (Array.isArray(value)) {
+          // Handle arrays by repeating the parameter name (not adding [])
+          value.forEach((item) => {
+            if (item !== undefined && item !== null) {
+              searchParams.append(key, String(item));
+            }
+          });
+        } else if (value !== undefined && value !== null) {
+          searchParams.append(key, String(value));
+        }
+      });
+
+      return searchParams.toString();
+    },
+  },
+});
+
+const inflightRequests = new Set();
+
+const networkQuiesced = debounce(() => {
+  document.dispatchEvent(new CustomEvent("network-quiesced"));
+}, 250);
+
+api.interceptors.request.use((config) => {
+  // Add request to set of inflight requests
+  inflightRequests.add(config.url);
+
+  // Cancel debounced networkQuiesced since a new request just came in
+  networkQuiesced.cancel();
+
+  // Set CSRF header for all requests
+  config.headers["x-csrftoken"] = Cookies.get("romm_csrftoken");
+  return config;
+});
+
+api.interceptors.response.use(
+  (response) => {
+    // Remove request from set of inflight requests
+    inflightRequests.delete(response.config.url);
+
+    // A successful response proves the backend is reachable. Surfaced via a
+    // DOM event (mirroring `network-quiesced`) so the v2 connection layer can
+    // react without this shared module importing anything from v2.
+    document.dispatchEvent(new CustomEvent("backend-online"));
+
+    // If there are no more inflight requests, fetch app-wide data
+    if (inflightRequests.size === 0) {
+      networkQuiesced();
+    }
+
+    return response;
+  },
+  async (error) => {
+    // Mirror the success path's bookkeeping: a settled request — even a failed
+    // or canceled one — leaves the inflight set so `network-quiesced` can still
+    // fire once the network goes quiet.
+    inflightRequests.delete(error.config?.url);
+    if (inflightRequests.size === 0) {
+      networkQuiesced();
+    }
+
+    // Canceled requests (AbortController / `signal`) are routine here (gallery /
+    // search aborts). They surface as a response-less error but are not a
+    // network failure, so they must never flip the connection state.
+    if (axios.isCancel(error)) {
+      return Promise.reject(error);
+    }
+
+    // Reachability signalling (see useServerConnection):
+    //   * no response (ERR_NETWORK / timeout) → definitively offline.
+    //   * 5xx from a non-heartbeat endpoint → "suspect"; ask the connection
+    //     layer to confirm via the authoritative /heartbeat probe (so one
+    //     buggy endpoint doesn't flash the banner, and the heartbeat request
+    //     itself never re-triggers this — which would loop).
+    //   * 4xx → backend is alive; emit backend-online so a stale offline banner
+    //     clears immediately instead of waiting for the next heartbeat poll.
+    const status = error.response?.status as number | undefined;
+    const url: string = error.config?.url ?? "";
+
+    // Ignore intentionally canceled requests (AbortController / signal). They do
+    // not indicate backend reachability problems.
+    if (axios.isCancel(error) || error.code === "ERR_CANCELED") {
+      return Promise.reject(error);
+    }
+
+    if (!error.response) {
+      document.dispatchEvent(new CustomEvent("backend-offline"));
+    } else if (
+      status !== undefined &&
+      status >= 500 &&
+      !url.includes("heartbeat")
+    ) {
+      document.dispatchEvent(new CustomEvent("backend-suspect"));
+    } else if (status !== undefined && status >= 400 && status < 500) {
+      document.dispatchEvent(new CustomEvent("backend-online"));
+    }
+
+    // A 403 is a permission denial for an authenticated caller (or a CSRF
+    // failure): the session is still valid, so stay on the page and let the
+    // caller surface the error. Only refresh the CSRF token when the backend
+    // rejected it, so the next attempt uses a fresh one.
+    if (isCsrfFailure(error)) {
+      await refetchCSRFToken().catch(() => {});
+    }
+
+    // A 401 means there are no valid credentials behind the request: clear
+    // the stale session and send the user to the login page.
+    if (error.response?.status === 401) {
+      // Clear cookies and redirect to login page
+      Cookies.remove("romm_session");
+
+      // Refetch CSRF cookie
+      await refetchCSRFToken().catch(() => {});
+
+      const pathname = window.location.pathname;
+      const search = window.location.search;
+      const params = new URLSearchParams(search);
+      const fullPath = pathname + search;
+
+      // Loaded lazily: a static import evaluates the router while this module
+      // is still initialising, so `router` reads as undefined.
+      const { default: router } = await import("@/plugins/router");
+
+      // Don't redirect to login if already on an auth-exempt route.
+      // Also resolve the route from the browser URL to handle the case where
+      // the router hasn't been started yet (e.g., during app initialization),
+      // which would otherwise cause router.currentRoute.value.name to be undefined.
+      const currentRoute = router.currentRoute.value.name?.toString() ?? "";
+      const resolvedRoute = router.resolve(window.location.pathname);
+      const resolvedRouteName = resolvedRoute.name?.toString() ?? "";
+      if (
+        isAuthExemptRoute(currentRoute) ||
+        isAuthExemptRoute(resolvedRouteName)
+      ) {
+        return Promise.reject(error);
+      }
+
+      router.push({
+        name: ROUTES.LOGIN,
+        query: {
+          next: params.get("next") ?? (pathname !== "/login" ? fullPath : "/"),
+        },
+      });
+    }
+    return Promise.reject(error);
+  },
+);
+
+export default api;
+
+// `fetch(..., { keepalive: true })` is the only way to reach the backend from a
+// page that is going away, and it does not run the request interceptor above,
+// so the CSRF header that interceptor sets has to be built by hand here.
+export function keepaliveHeaders(): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    "x-csrftoken": Cookies.get("romm_csrftoken") ?? "",
+  };
+}
+
+/** Whether the backend turned a request down over its CSRF token, not its user. */
+export function isCsrfFailure(error: unknown): boolean {
+  const response = axios.isAxiosError(error) ? error.response : undefined;
+  return (
+    response?.status === 403 &&
+    typeof response.data === "string" &&
+    response.data.includes("CSRF")
+  );
+}
+
+export async function refetchCSRFToken() {
+  Cookies.remove("romm_csrftoken");
+
+  return await api.get("/heartbeat");
+}

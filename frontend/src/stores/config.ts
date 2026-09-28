@@ -1,0 +1,166 @@
+import { defineStore } from "pinia";
+import type {
+  ConfigResponse,
+  EjsControlsButton,
+  ExclusionType,
+} from "@/__generated__";
+import api from "@/services/api";
+
+export type Config = ConfigResponse;
+
+// The backend lowercases folder names before writing them to config.yml, so
+// every read and write of a mapping normalizes the on-disk name the same way.
+function normalizeFsSlug(fsSlug: string): string {
+  return fsSlug.toLowerCase();
+}
+
+const defaultConfig = {
+  CONFIG_FILE_MOUNTED: false,
+  CONFIG_FILE_WRITABLE: false,
+  CONFIG_FILE_PARSE_ERROR: null,
+  EXCLUDED_PLATFORMS: [],
+  EXCLUDED_SINGLE_EXT: [],
+  EXCLUDED_SINGLE_FILES: [],
+  EXCLUDED_MULTI_FILES: [],
+  EXCLUDED_MULTI_PARTS_EXT: [],
+  EXCLUDED_MULTI_PARTS_FILES: [],
+  DEFAULT_EXCLUDED_PLATFORM_DIRS: [],
+  DEFAULT_EXCLUDED_MULTI_FILE_DIRS: [],
+  DEFAULT_EXCLUDED_FILES: [],
+  DEFAULT_EXCLUDED_EXTENSIONS: [],
+  PLATFORMS_BINDING: {},
+  PLATFORMS_VERSIONS: {},
+  SKIP_HASH_CALCULATION: false,
+  EJS_DEBUG: false,
+  EJS_NETPLAY_ENABLED: false,
+  EJS_CACHE_LIMIT: null,
+  EJS_DISABLE_AUTO_UNLOAD: false,
+  EJS_DISABLE_BATCH_BOOTUP: false,
+  EJS_ENABLE_AUTO_SAVE_SYNC: true,
+  EJS_NETPLAY_ICE_SERVERS: [],
+  EJS_DEFAULT_CORES: {},
+  EJS_SETTINGS: {},
+  EJS_CONTROLS: {},
+  SCAN_METADATA_PRIORITY: [],
+  SCAN_ARTWORK_PRIORITY: [],
+  SCAN_ARTWORK_PRIORITY_OVERRIDES: {},
+  SCAN_REGION_PRIORITY: [],
+  SCAN_LANGUAGE_PRIORITY: [],
+  SCAN_MEDIA: [],
+  GAMELIST_AUTO_EXPORT_ON_SCAN: false,
+  GAMELIST_MEDIA_THUMBNAIL: "box2d",
+  GAMELIST_MEDIA_IMAGE: "screenshot",
+  PEGASUS_AUTO_EXPORT_ON_SCAN: false,
+} as ConfigResponse;
+
+export default defineStore("config", {
+  state: () => ({
+    config: { ...defaultConfig },
+  }),
+
+  actions: {
+    async fetchConfig({
+      rethrow = false,
+    }: { rethrow?: boolean } = {}): Promise<ConfigResponse> {
+      try {
+        const response = await api.get("/config");
+        this.config = response.data;
+        return this.config;
+      } catch (error) {
+        console.error("Error fetching config: ", error);
+        if (rethrow) throw error;
+        return this.config;
+      }
+    },
+    getPlatformBinding(fsSlug: string): string | undefined {
+      return this.config.PLATFORMS_BINDING[normalizeFsSlug(fsSlug)];
+    },
+    addPlatformBinding(fsSlug: string, slug: string) {
+      this.config.PLATFORMS_BINDING[normalizeFsSlug(fsSlug)] = slug;
+    },
+    removePlatformBinding(fsSlug: string) {
+      delete this.config.PLATFORMS_BINDING[normalizeFsSlug(fsSlug)];
+    },
+    getPlatformVersion(fsSlug: string): string | undefined {
+      return this.config.PLATFORMS_VERSIONS[normalizeFsSlug(fsSlug)];
+    },
+    addPlatformVersion(fsSlug: string, slug: string) {
+      this.config.PLATFORMS_VERSIONS[normalizeFsSlug(fsSlug)] = slug;
+    },
+    removePlatformVersion(fsSlug: string) {
+      delete this.config.PLATFORMS_VERSIONS[normalizeFsSlug(fsSlug)];
+    },
+    addExclusion(exclusionType: ExclusionType, exclusionValue: string) {
+      this.config[exclusionType].push(exclusionValue);
+    },
+    removeExclusion(exclusionValue: string, exclusionType: ExclusionType) {
+      const index = this.config[exclusionType].indexOf(exclusionValue);
+      if (index !== -1) {
+        this.config[exclusionType].splice(index, 1);
+      } else {
+        console.error(
+          `Value '${exclusionValue}' not found in exclusion type '${exclusionType}'`,
+        );
+      }
+    },
+    isExclusionType(type: string): type is ExclusionType {
+      return Object.keys(this.config).includes(type);
+    },
+    getEJSDefaultCore(platformSlug: string): string | null {
+      return this.config.EJS_DEFAULT_CORES[platformSlug.toLowerCase()] ?? null;
+    },
+    getEJSCoreOptions(core: string | null): Record<string, string | boolean> {
+      const defaultOptions = this.config.EJS_SETTINGS["default"] || {};
+      if (!core) return defaultOptions;
+      return {
+        ...defaultOptions,
+        ...this.config.EJS_SETTINGS[core],
+      };
+    },
+    getEJSControls(
+      core: string | null,
+    ): Record<number, Record<number, EjsControlsButton>> | null {
+      const defaultControls = this.config.EJS_CONTROLS["default"];
+      if (!core) {
+        if (!defaultControls) return null;
+        return {
+          0: defaultControls["_0"] || {},
+          1: defaultControls["_1"] || {},
+          2: defaultControls["_2"] || {},
+          3: defaultControls["_3"] || {},
+        };
+      }
+
+      const coreControls = this.config.EJS_CONTROLS[core];
+      if (!coreControls) return null;
+      if (!defaultControls) {
+        return {
+          0: coreControls["_0"] || {},
+          1: coreControls["_1"] || {},
+          2: coreControls["_2"] || {},
+          3: coreControls["_3"] || {},
+        };
+      }
+
+      return {
+        0: {
+          ...(defaultControls["_0"] || {}),
+          ...(coreControls["_0"] || {}),
+        },
+        1: {
+          ...(defaultControls["_1"] || {}),
+          ...(coreControls["_1"] || {}),
+        },
+        2: {
+          ...(defaultControls["_2"] || {}),
+          ...(coreControls["_2"] || {}),
+        },
+        3: {
+          ...(defaultControls["_3"] || {}),
+          ...(coreControls["_3"] || {}),
+        },
+      };
+    },
+    reset() {},
+  },
+});

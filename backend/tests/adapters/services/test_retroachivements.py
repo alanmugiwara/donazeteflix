@@ -1,0 +1,422 @@
+import json
+from typing import cast
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import aiohttp
+import pytest
+import yarl
+from fastapi import HTTPException, status
+
+from adapters.services import retroachievements
+from adapters.services.retroachievements import (
+    RetroAchievementsService,
+    auth_middleware,
+)
+
+INVALID_GAME_ID = 999999
+
+# RA sends null credits for games without them, such as homebrew and hacks.
+UNCREDITED_GAME = {
+    "ID": 1,
+    "Title": "Homebrew",
+    "ConsoleID": 1,
+    "ForumTopicID": None,
+    "ImageIcon": "",
+    "ImageTitle": "",
+    "ImageIngame": "",
+    "ImageBoxArt": "",
+    "Publisher": None,
+    "Developer": None,
+    "Genre": None,
+    "Released": None,
+    "ReleasedAtGranularity": None,
+    "RichPresencePatch": "",
+    "GuideURL": None,
+    "ConsoleName": "Genesis/Mega Drive",
+    "ParentGameID": None,
+    "NumDistinctPlayers": 0,
+    "NumAchievements": 0,
+    "Achievements": {},
+}
+
+
+def _session_returning(body: dict[str, object]) -> MagicMock:
+    mock_response = MagicMock()
+    mock_response.read = AsyncMock(return_value=json.dumps(body).encode())
+    mock_response.raise_for_status.return_value = None
+    mock_session = AsyncMock()
+    mock_session.get.return_value = mock_response
+    mock_context = MagicMock()
+    mock_context.get.return_value = mock_session
+    return mock_context
+
+
+class TestAuthMiddleware:
+    @patch("adapters.services.retroachievements.RETROACHIEVEMENTS_API_KEY", "test_key")
+    @pytest.mark.asyncio
+    async def test_auth_middleware_adds_api_key(self):
+        """Test that auth middleware adds API key to request URL."""
+        # Create a real request-like object
+        mock_request = MagicMock()
+        mock_request.url = yarl.URL("https://retroachievements.org/API")
+
+        mock_handler = AsyncMock()
+        mock_response = MagicMock()
+        mock_handler.return_value = mock_response
+
+        result = await auth_middleware(mock_request, mock_handler)
+
+        # Check that the URL now contains the API key
+        expected_url = yarl.URL("https://retroachievements.org/API").with_query(
+            y="test_key"
+        )
+        assert mock_request.url == expected_url
+        mock_handler.assert_called_once_with(mock_request)
+        assert result == mock_response
+
+    @patch("adapters.services.retroachievements.RETROACHIEVEMENTS_API_KEY", None)
+    @pytest.mark.asyncio
+    async def test_auth_middleware_sends_empty_key_when_unset(self):
+        mock_request = MagicMock()
+        mock_request.url = yarl.URL("https://retroachievements.org/API")
+        mock_handler = AsyncMock()
+
+        await auth_middleware(mock_request, mock_handler)
+
+        assert mock_request.url == yarl.URL(
+            "https://retroachievements.org/API"
+        ).with_query(y="")
+        mock_handler.assert_called_once_with(mock_request)
+
+
+class TestRetroAchievementsServiceUnit:
+    """Unit tests with mocked dependencies."""
+
+    @pytest.fixture
+    def service(self):
+        """Create a RetroAchievementsService instance for testing."""
+        return RetroAchievementsService()
+
+    @pytest.fixture
+    def service_custom_url(self):
+        """Create a RetroAchievementsService instance with custom URL."""
+        return RetroAchievementsService("https://custom.api.com")
+
+    def test_init_default_url(self, service):
+        """Test service initialization with default URL."""
+        assert str(service.url) == "https://retroachievements.org/API"
+
+    def test_init_custom_url(self, service_custom_url):
+        """Test service initialization with custom URL."""
+        assert str(service_custom_url.url) == "https://custom.api.com"
+
+    @pytest.mark.asyncio
+    async def test_request_connection_error(self, service):
+        """Test request with connection error."""
+        mock_session = AsyncMock()
+        mock_session.get.side_effect = aiohttp.ClientConnectionError(
+            "Connection failed"
+        )
+        mock_context = MagicMock()
+        mock_context.get.return_value = mock_session
+
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session", mock_context
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await service._request("https://retroachievements.org/API", object)
+
+        assert exc_info.value.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        assert "Can't connect to RetroAchievements" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_request_raises_when_ra_refuses(self, service):
+        mock_response = MagicMock()
+        mock_response.raise_for_status.side_effect = aiohttp.ClientResponseError(
+            request_info=MagicMock(), history=(), status=500
+        )
+        mock_session = AsyncMock()
+        mock_session.get.return_value = mock_response
+        mock_context = MagicMock()
+        mock_context.get.return_value = mock_session
+
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session", mock_context
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await service._request("https://retroachievements.org/API", object)
+
+        assert exc_info.value.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_request_reads_an_unknown_id_as_none(self, service):
+        mock_response = MagicMock()
+        mock_response.read = AsyncMock(return_value=b"[]")
+        mock_response.raise_for_status.return_value = None
+        mock_session = AsyncMock()
+        mock_session.get.return_value = mock_response
+        mock_context = MagicMock()
+        mock_context.get.return_value = mock_session
+
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session", mock_context
+        ):
+            assert await service.get_game_extended_details(999999) is None
+
+    @pytest.mark.asyncio
+    async def test_game_extended_details_accept_missing_credits(self, service):
+        body = {
+            **UNCREDITED_GAME,
+            "Updated": "2025-07-06T16:20:59.000000Z",
+            "NumDistinctPlayersCasual": 0,
+            "NumDistinctPlayersHardcore": 0,
+        }
+
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session",
+            _session_returning(body),
+        ):
+            assert await service.get_game_extended_details(1) == body
+
+    @pytest.mark.asyncio
+    async def test_user_game_progress_accepts_missing_credits(self, service):
+        body = {
+            **UNCREDITED_GAME,
+            "NumAwardedToUser": 0,
+            "NumAwardedToUserHardcore": 0,
+            "NumDistinctPlayersCasual": 0,
+            "NumDistinctPlayersHardcore": 0,
+            "UserCompletion": "0.00%",
+            "UserCompletionHardcore": "0.00%",
+        }
+
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session",
+            _session_returning(body),
+        ):
+            assert await service.get_user_game_progress("user", 1) == body
+
+    @pytest.mark.asyncio
+    async def test_a_failed_progress_page_aborts_the_iteration(self, service):
+        first_page = {"Count": 500, "Total": 1000, "Results": [{}] * 500}
+        unavailable = HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+        with patch.object(
+            service,
+            "get_user_completion_progress",
+            AsyncMock(side_effect=[first_page, unavailable]),
+        ):
+            with pytest.raises(HTTPException):
+                async for _ in service.iter_user_completion_progress("user"):
+                    pass
+
+    @pytest.mark.asyncio
+    async def test_request_acquires_rate_limiter(self, service):
+        """Test that the request reserves a rate-limiter slot before sending."""
+        mock_response = MagicMock()
+        mock_response.read = AsyncMock(return_value=json.dumps({}).encode())
+        mock_response.raise_for_status.return_value = None
+
+        # Record the order in which the rate limiter is acquired and the request is sent
+        call_order: list[str] = []
+        acquire_mock = cast(AsyncMock, retroachievements._rate_limiter.acquire)
+        acquire_mock.side_effect = lambda *a, **k: call_order.append("acquire")
+
+        async def record_get(*args, **kwargs):
+            call_order.append("get")
+            return mock_response
+
+        mock_session = AsyncMock()
+        mock_session.get.side_effect = record_get
+
+        mock_context = MagicMock()
+        mock_context.get.return_value = mock_session
+
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session", mock_context
+        ):
+            await service._request("https://retroachievements.org/API", object)
+
+        # The rate-limiter slot must be reserved, and before the request is sent.
+        acquire_mock.assert_awaited_once()
+        mock_session.get.assert_awaited_once()
+        assert call_order == [
+            "acquire",
+            "get",
+        ], "rate limiter must be acquired before the GET is sent"
+
+
+class TestRetroAchievementsServiceIntegration:
+    @pytest.fixture
+    def service(self):
+        """Create a RetroAchievementsService instance for integration testing."""
+        return RetroAchievementsService()
+
+    @pytest.mark.asyncio
+    @pytest.mark.vcr
+    async def test_get_game_extended_details_real_api(
+        self, service, mock_ctx_aiohttp_session
+    ):
+        """Test get_game_extended_details with real API call."""
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session",
+            mock_ctx_aiohttp_session,
+        ):
+            result = await service.get_game_extended_details(1)
+
+        # Verify response structure
+        assert isinstance(result, dict)
+        assert "ID" in result or "GameID" in result
+        assert "Title" in result
+        assert "ConsoleID" in result
+
+    @pytest.mark.asyncio
+    @pytest.mark.vcr
+    async def test_get_game_list_real_api(self, service, mock_ctx_aiohttp_session):
+        """Test get_game_list with real API call."""
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session",
+            mock_ctx_aiohttp_session,
+        ):
+            result = await service.get_game_list(1, limit=5)
+
+        # Verify response structure
+        assert isinstance(result, list)
+        if result:  # If there are games
+            game = result[0]
+            assert "ID" in game or "GameID" in game
+            assert "Title" in game
+
+    @pytest.mark.asyncio
+    @pytest.mark.vcr
+    async def test_get_game_list_with_options_real_api(
+        self, service, mock_ctx_aiohttp_session
+    ):
+        """Test get_game_list with all options using real API call."""
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session",
+            mock_ctx_aiohttp_session,
+        ):
+            result = await service.get_game_list(
+                1,
+                only_games_with_achievements=True,
+                include_hashes=True,
+                limit=3,
+                offset=0,
+            )
+
+        # Verify response structure
+        assert isinstance(result, list)
+        assert len(result) <= 3  # Should respect limit
+
+    @pytest.mark.asyncio
+    @pytest.mark.vcr
+    async def test_get_user_completion_progress_real_api(
+        self, service, mock_ctx_aiohttp_session
+    ):
+        """Test get_user_completion_progress with real API call."""
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session",
+            mock_ctx_aiohttp_session,
+        ):
+            # The recording caught RA rejecting the key, which is a failed request.
+            with pytest.raises(HTTPException) as exc_info:
+                await service.get_user_completion_progress("arcanecraeda", limit=5)
+
+        assert exc_info.value.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    @pytest.mark.vcr
+    async def test_get_user_completion_progress_with_pagination_real_api(
+        self, service, mock_ctx_aiohttp_session
+    ):
+        """Test get_user_completion_progress with pagination using real API call."""
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session",
+            mock_ctx_aiohttp_session,
+        ):
+            result = await service.get_user_completion_progress(
+                "Scott", limit=3, offset=0
+            )
+
+        # Verify response structure
+        assert isinstance(result, dict)
+        assert "Total" in result
+        assert "Results" in result
+        assert len(result["Results"]) <= 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.vcr
+    async def test_iter_user_completion_progress_real_api(
+        self, service, mock_ctx_aiohttp_session
+    ):
+        """Test iter_user_completion_progress with real API call."""
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session",
+            mock_ctx_aiohttp_session,
+        ):
+            results = []
+            count = 0
+            async for result in service.iter_user_completion_progress("Scott"):
+                results.append(result)
+                count += 1
+                if count >= 5:  # Limit iterations for testing
+                    break
+
+        # Verify we got results
+        assert len(results) > 0
+        if results:
+            result = results[0]
+            assert isinstance(result, dict)
+            # Check for expected fields in completion progress
+            assert any(key in result for key in ["GameID", "ID", "Title"])
+
+    @pytest.mark.asyncio
+    @pytest.mark.vcr
+    async def test_get_user_game_progress_real_api(
+        self, service, mock_ctx_aiohttp_session
+    ):
+        """Test get_user_game_progress with real API call."""
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session",
+            mock_ctx_aiohttp_session,
+        ):
+            result = await service.get_user_game_progress("Scott", 1)
+
+        # Verify response structure
+        assert isinstance(result, dict)
+        # The response should contain game info and user progress
+        assert any(key in result for key in ["ID", "GameID", "Title"])
+
+    @pytest.mark.asyncio
+    @pytest.mark.vcr
+    async def test_get_user_game_progress_with_award_metadata_real_api(
+        self, service, mock_ctx_aiohttp_session
+    ):
+        """Test get_user_game_progress with award metadata using real API call."""
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session",
+            mock_ctx_aiohttp_session,
+        ):
+            result = await service.get_user_game_progress(
+                "Scott", 1, include_award_metadata=True
+            )
+
+        # Verify response structure
+        assert isinstance(result, dict)
+        assert any(key in result for key in ["ID", "GameID", "Title"])
+
+    @pytest.mark.asyncio
+    @pytest.mark.vcr
+    async def test_error_handling_real_api(self, service, mock_ctx_aiohttp_session):
+        """Test error handling with real API calls."""
+        with patch(
+            "adapters.services.retroachievements.ctx_aiohttp_session",
+            mock_ctx_aiohttp_session,
+        ):
+            with patch(
+                "adapters.services.retroachievements.RETROACHIEVEMENTS_API_KEY",
+                "invalid_key",
+            ):
+                # This should handle the error gracefully
+                result = await service.get_game_extended_details(INVALID_GAME_ID)
+                assert result is None

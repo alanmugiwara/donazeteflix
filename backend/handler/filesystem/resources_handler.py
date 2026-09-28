@@ -1,0 +1,971 @@
+import asyncio
+import gzip
+import os
+from collections.abc import Callable, Iterable, Sequence
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Final, NamedTuple, cast
+
+import httpx2
+from anyio import Path as AnyioPath
+from fastapi import status
+from PIL import Image, ImageFile, UnidentifiedImageError
+
+from adapters.services.screenscraper import media_download_slot
+from config import ENABLE_SCHEDULED_CONVERT_IMAGES_TO_WEBP, RESOURCES_BASE_PATH
+from config.config_manager import MetadataMediaType
+from logger.logger import log
+from models.collection import Collection
+from models.rom import Rom
+from tasks.scheduled.convert_images_to_webp import ImageConverter
+from utils.concurrency import gather_all
+from utils.context import ctx_httpx_client
+from utils.images import frame_durations, is_animated, webp_loop
+from utils.rate_limiter import ConcurrencyLimiter
+
+from .base_handler import CoverSize, FSHandler
+
+LOCAL_FILE_SCHEMES = ("file://", "launchbox-file://")
+
+ALLOWED_MANUAL_EXTENSIONS = frozenset({".pdf", ".md", ".txt"})
+
+# An achievement set runs to hundreds of badges, so they are fetched a few at a
+# time across every scan rather than all at once.
+RA_BADGE_MAX_CONCURRENCY: Final[int] = 8
+_ra_badge_limiter = ConcurrencyLimiter(RA_BADGE_MAX_CONCURRENCY)
+
+
+def _resolve_local_file_uri(uri: str) -> Path | None:
+    """Resolve a local-file URI to an absolute Path, or None if unsafe/unknown.
+
+    `file://` resolves under the ROM library root. `launchbox-file://` resolves
+    under the LaunchBox data root, since LaunchBox metadata produces paths
+    relative to `/romm/launchbox`, which is not the same as the library root.
+    """
+    from handler.filesystem import fs_rom_handler, get_fs_launchbox_handler
+
+    if uri.startswith("launchbox-file://"):
+        try:
+            return get_fs_launchbox_handler().validate_path(
+                uri[len("launchbox-file://") :]
+            )
+        except ValueError:
+            return None
+
+    if uri.startswith("file://"):
+        try:
+            return fs_rom_handler.validate_path(uri[len("file://") :])
+        except ValueError:
+            return None
+
+    return None
+
+
+def _content_type_essence(header_value: str) -> str:
+    """Return the MIME type token (before parameters), lowercased."""
+    if not header_value:
+        return ""
+
+    return (
+        header_value.split(";", 1)[0].strip().lower().lstrip("\ufeff")
+    )  # Remove BOM if present
+
+
+def _check_content_type(
+    response: httpx2.Response, allowed_prefixes: tuple[str, ...], label: str
+) -> bool:
+    raw = response.headers.get("content-type", "")
+    essence = _content_type_essence(raw)
+    if not essence or not any(essence.startswith(p) for p in allowed_prefixes):
+        log.warning(
+            f"Unexpected content type for {label}: {raw or '(missing header)'}",
+        )
+        return False
+    return True
+
+
+# Some providers (notably ScreenScraper) serve a solid chroma-key green square
+# as a stand-in when a requested image doesn't exist. Persisting it would paint
+# a bright green cover or 3D-box face, so we detect and drop it instead.
+_CHROMA_KEY_GREEN = (0, 255, 0)
+_CHROMA_KEY_TOLERANCE = 24
+_CHROMA_KEY_COVERAGE = 0.9
+
+
+def _is_chroma_key_placeholder(image_path: Path) -> bool:
+    """True if the image is (almost) entirely a chroma-key green fill."""
+    try:
+        with Image.open(image_path) as img:
+            sample = img.convert("RGB")
+            sample.thumbnail((32, 32))  # cheap: sample a downscaled copy
+            raw = sample.tobytes()  # flat RGB triples
+    except UnidentifiedImageError, OSError, ValueError:
+        return False
+
+    total = len(raw) // 3
+    if total == 0:
+        return False
+
+    r0, g0, b0 = _CHROMA_KEY_GREEN
+    green = 0
+    for i in range(0, total * 3, 3):
+        if (
+            abs(raw[i] - r0) <= _CHROMA_KEY_TOLERANCE
+            and abs(raw[i + 1] - g0) <= _CHROMA_KEY_TOLERANCE
+            and abs(raw[i + 2] - b0) <= _CHROMA_KEY_TOLERANCE
+        ):
+            green += 1
+    return green / total >= _CHROMA_KEY_COVERAGE
+
+
+class RecordedMedia(NamedTuple):
+    """A media file a provider metadata dict records a path for."""
+
+    media_type: MetadataMediaType
+    # The provider dict itself, or one of its later-disc entries.
+    owner: dict[str, Any]
+    key: str
+    url: str | None
+
+    @property
+    def path(self) -> str:
+        return cast(str, self.owner[self.key])
+
+
+class _PathClaim(NamedTuple):
+    """Which provider a shared media path's file belongs to, and its source."""
+
+    provider: int
+    url: str | None
+
+
+class FSResourcesHandler(FSHandler):
+    def __init__(self) -> None:
+        super().__init__(base_path=RESOURCES_BASE_PATH)
+        self.image_converter = ImageConverter()
+
+    def get_platform_resources_path(self, platform_id: int) -> str:
+        return os.path.join("roms", str(platform_id))
+
+    # Cover art
+    def cover_exists(self, entity: Rom | Collection, size: CoverSize) -> bool:
+        """Check if rom cover exists in filesystem
+
+        Args:
+            fs_slug: short name of the platform
+            rom_name: name of rom file
+            size: size of the cover
+        Returns
+            True if cover exists in filesystem else False
+        """
+        full_path = self.validate_path(f"{entity.fs_resources_path}/cover")
+        for _ in full_path.glob(f"{size.value}.*"):
+            return True  # At least one file found
+        return False
+
+    def resize_cover_to_small(self, cover: ImageFile.ImageFile, save_path: str) -> None:
+        """Resize cover to small size, and save it to filesystem."""
+        if cover.height >= 1000:
+            ratio = 0.2
+        else:
+            ratio = 0.4
+
+        small_width = int(cover.width * ratio)
+        small_height = int(cover.height * ratio)
+        small_size = (small_width, small_height)
+
+        frames: list[Image.Image] = []
+        durations = frame_durations(
+            cover, lambda frame: frames.append(frame.convert("RGBA").resize(small_size))
+        )
+        if durations:
+            # WebP whatever the extension, as it encodes whole composited frames
+            frames[0].save(
+                save_path,
+                format="WEBP",
+                save_all=True,
+                append_images=frames[1:],
+                duration=durations,
+                loop=webp_loop(cover),
+            )
+            return
+
+        small_img = cover.resize(small_size)
+        small_img.save(save_path)
+
+    def _write_derived_covers(
+        self, path_cover_l: Path, path_cover_s: Path, convert_large: bool = True
+    ) -> None:
+        """Write the small cover and the WebP copies; blocking, so run in a thread.
+
+        Args:
+            convert_large: Also refresh the large cover's WebP copy.
+        """
+        with Image.open(path_cover_l) as img:
+            self.resize_cover_to_small(img, save_path=str(path_cover_s))
+
+        if ENABLE_SCHEDULED_CONVERT_IMAGES_TO_WEBP:
+            if convert_large:
+                self.image_converter.convert_to_webp(path_cover_l, force=True)
+            self.image_converter.convert_to_webp(path_cover_s, force=True)
+
+    async def _discard_if_chroma_key(self, relative_path: str) -> bool:
+        """Remove a just-downloaded image if it's a chroma-key placeholder.
+
+        Returns True when the file was discarded, so callers can treat the
+        artwork as missing (falling back to the dark placeholder).
+        """
+        if not await self.file_exists(relative_path):
+            return False
+
+        if not _is_chroma_key_placeholder(self.validate_path(relative_path)):
+            return False
+
+        log.debug(f"Discarding chroma-key placeholder image {relative_path}")
+        await self.remove_file(relative_path)
+        return True
+
+    async def _discard_partial_file(self, relative_path: str) -> None:
+        """Remove a partially written file left behind by a failed download.
+
+        A truncated image is worse than a missing one: it satisfies the
+        `*_exists` checks, so later scans skip it and never refetch it.
+        """
+        try:
+            if await self.file_exists(relative_path):
+                await self.remove_file(relative_path)
+        except OSError as exc:
+            log.error(f"Unable to remove partial file {relative_path}: {str(exc)}")
+
+    async def _store_cover(self, entity: Rom | Collection, url_cover: str) -> None:
+        """Fetch a cover once and write both sizes.
+
+        Args:
+            entity: Rom or Collection object
+            url_cover: url to get the cover
+        """
+        cover_file = f"{entity.fs_resources_path}/cover"
+        big_path = f"{cover_file}/{CoverSize.BIG.value}.png"
+        small_path = f"{cover_file}/{CoverSize.SMALL.value}.png"
+        await self.make_directory(cover_file)
+
+        # Handle local-file URIs from metadata handlers (gamelist, LaunchBox)
+        if url_cover.startswith(LOCAL_FILE_SCHEMES):
+            try:
+                resolved = _resolve_local_file_uri(url_cover)
+                if resolved is None or not await AnyioPath(resolved).exists():
+                    log.warning(f"Cover file not found: {url_cover}")
+                    return None
+                # Covers are rewritten in place by later scans, which would
+                # mutate the user's source image through a hardlink.
+                await self.copy_file(resolved, big_path, allow_link=False)
+            except Exception as exc:
+                log.error(f"Unable to copy cover file {url_cover}: {str(exc)}")
+                await self._discard_partial_file(big_path)
+                return None
+        else:
+            # Handle HTTP URLs
+            httpx_client = ctx_httpx_client.get()
+            downloaded = False
+            try:
+                async with media_download_slot(url_cover) as timeout:
+                    async with httpx_client.stream(
+                        "GET", url_cover, timeout=timeout
+                    ) as response:
+                        if response.status_code == status.HTTP_200_OK:
+                            if not _check_content_type(response, ("image/",), "cover"):
+                                return None
+
+                            # Check if content is gzipped from response headers
+                            is_gzipped = (
+                                response.headers.get("content-encoding", "").lower()
+                                == "gzip"
+                            )
+
+                            async with self.write_file_streamed(
+                                path=cover_file, filename=f"{CoverSize.BIG.value}.png"
+                            ) as f:
+                                if is_gzipped:
+                                    # Content is gzipped, decompress it
+                                    content = await response.aread()
+                                    try:
+                                        decompressed_content = gzip.decompress(content)
+                                        await f.write(decompressed_content)
+                                    except gzip.BadGzipFile:
+                                        await f.write(content)
+                                else:
+                                    # Content is not gzipped, stream directly
+                                    async for chunk in response.aiter_raw():
+                                        await f.write(chunk)
+
+                            downloaded = True
+            except httpx2.TransportError as exc:
+                log.error(f"Unable to fetch cover at {url_cover}: {str(exc)}")
+                return None
+            except OSError as exc:
+                log.error(f"Unable to write cover for {url_cover}: {str(exc)}")
+                return None
+
+            if not downloaded:
+                return None
+
+        try:
+            if await self._discard_if_chroma_key(big_path):
+                # A small cover left by an earlier scan would outlive the large
+                # one it was derived from.
+                await self._discard_partial_file(small_path)
+                return None
+
+            await asyncio.to_thread(
+                self._write_derived_covers,
+                self.validate_path(big_path),
+                self.validate_path(small_path),
+            )
+        except UnidentifiedImageError as exc:
+            # Undecodable bytes still satisfy cover_exists(), so keeping them
+            # would stop every later scan from refetching a working cover.
+            log.error(f"Unable to identify image {big_path}: {str(exc)}")
+            for path in (big_path, small_path):
+                await self._discard_partial_file(path)
+        except OSError as exc:
+            log.error(f"Unable to write cover for {url_cover}: {str(exc)}")
+            for path in (big_path, small_path):
+                await self._discard_partial_file(path)
+
+    async def _derive_small_cover(self, entity: Rom | Collection) -> None:
+        """Rebuild a missing small cover from the large one already on disk.
+
+        Args:
+            entity: Rom or Collection object
+        """
+        path_cover_l = self._get_cover_path(entity, CoverSize.BIG)
+        if not path_cover_l:
+            return
+
+        path_cover_s = (
+            f"{entity.fs_resources_path}/cover/"
+            f"{CoverSize.SMALL.value}{Path(path_cover_l).suffix}"
+        )
+
+        try:
+            await asyncio.to_thread(
+                self._write_derived_covers,
+                self.validate_path(path_cover_l),
+                self.validate_path(path_cover_s),
+                convert_large=False,
+            )
+        except (UnidentifiedImageError, OSError) as exc:
+            # Unlike a fresh download, these bytes weren't written here, so the
+            # large cover stays put and only the partial small one is dropped.
+            log.error(f"Unable to resize cover {path_cover_l}: {str(exc)}")
+            await self._discard_partial_file(path_cover_s)
+
+    def _get_cover_path(self, entity: Rom | Collection, size: CoverSize) -> str | None:
+        """Returns rom cover filesystem path adapted to frontend folder structure
+
+        Args:
+            entity: Rom or Collection object
+            size: size of the cover
+        """
+        full_path = self.validate_path(f"{entity.fs_resources_path}/cover")
+        for matched_file in full_path.glob(f"{size.value}.*"):
+            return str(matched_file.relative_to(self.base_path))
+
+        return None
+
+    async def get_cover(
+        self, entity: Rom | Collection | None, overwrite: bool, url_cover: str | None
+    ) -> tuple[str | None, str | None]:
+        if not entity:
+            return None, None
+
+        has_cover_l = self.cover_exists(entity, CoverSize.BIG)
+        has_cover_s = self.cover_exists(entity, CoverSize.SMALL)
+
+        # A single fetch writes both sizes
+        if url_cover and (overwrite or not has_cover_l):
+            await self._store_cover(entity, url_cover)
+        elif has_cover_l and not has_cover_s:
+            # Refetching to recover the small cover would overwrite a large one
+            # that is already good, and lose it if the fetch fails.
+            await self._derive_small_cover(entity)
+
+        # Return paths for existing covers
+        path_cover_s = (
+            self._get_cover_path(entity, CoverSize.SMALL)
+            if self.cover_exists(entity, CoverSize.SMALL)
+            else None
+        )
+        path_cover_l = (
+            self._get_cover_path(entity, CoverSize.BIG)
+            if self.cover_exists(entity, CoverSize.BIG)
+            else None
+        )
+
+        return path_cover_s, path_cover_l
+
+    async def remove_cover(self, entity: Rom | Collection | None) -> dict[str, str]:
+        if not entity:
+            return {"path_cover_s": "", "path_cover_l": ""}
+
+        await self.remove_directory(f"{entity.fs_resources_path}/cover")
+
+        return {"path_cover_s": "", "path_cover_l": ""}
+
+    async def _build_artwork_path(
+        self, entity: Rom | Collection, file_ext: str
+    ) -> tuple[Path, Path]:
+        path_cover = f"{entity.fs_resources_path}/cover"
+        path_cover_l = self.validate_path(
+            f"{path_cover}/{CoverSize.BIG.value}.{file_ext}"
+        )
+        path_cover_s = self.validate_path(
+            f"{path_cover}/{CoverSize.SMALL.value}.{file_ext}"
+        )
+
+        await self.make_directory(path_cover)
+
+        return path_cover_l, path_cover_s
+
+    async def store_artwork(
+        self, entity: Rom | Collection, artwork: BytesIO, file_ext: str
+    ) -> tuple[str | None, str | None]:
+        """Store artwork in filesystem and return paths."""
+        path_cover_l, path_cover_s = await self._build_artwork_path(entity, file_ext)
+
+        try:
+            with Image.open(artwork) as img:
+                if is_animated(img):
+                    # Kept as uploaded: re-encoding composited frames loses quality
+                    await self.write_file(
+                        artwork,
+                        path=f"{entity.fs_resources_path}/cover",
+                        filename=path_cover_l.name,
+                    )
+                else:
+                    img.save(path_cover_l)
+            await asyncio.to_thread(
+                self._write_derived_covers, path_cover_l, path_cover_s
+            )
+        except UnidentifiedImageError as exc:
+            log.error(
+                f"Unable to identify image for {entity.fs_resources_path}: {str(exc)}"
+            )
+            return None, None
+        except OSError as exc:
+            log.error(
+                f"Unable to write artwork for {entity.fs_resources_path}: {str(exc)}"
+            )
+            for path in (path_cover_l, path_cover_s):
+                await self._discard_partial_file(str(path.relative_to(self.base_path)))
+            return None, None
+
+        return str(path_cover_l.relative_to(self.base_path)), str(
+            path_cover_s.relative_to(self.base_path)
+        )
+
+    # Screenshots
+    async def _store_screenshot(self, rom: Rom, url_screenhot: str, idx: int) -> bool:
+        """Store roms resources in filesystem
+
+        Args:
+            rom: Rom object
+            url_screenhot: URL to get the screenshot
+        Returns
+            True if the screenshot landed on disk else False
+        """
+        screenshot_path = f"{rom.fs_resources_path}/screenshots"
+        await self.make_directory(screenshot_path)
+
+        # Handle local-file URIs from metadata handlers (gamelist, LaunchBox)
+        if url_screenhot.startswith(LOCAL_FILE_SCHEMES):
+            try:
+                resolved = _resolve_local_file_uri(url_screenhot)
+                if resolved is None or not await AnyioPath(resolved).exists():
+                    log.warning(f"Screenshot file not found: {url_screenhot}")
+                    return False
+                await self.copy_file(
+                    resolved, f"{screenshot_path}/{idx}.jpg", allow_link=True
+                )
+                return True
+            except Exception as exc:
+                log.error(f"Unable to copy screenshot file {url_screenhot}: {str(exc)}")
+                await self._discard_partial_file(f"{screenshot_path}/{idx}.jpg")
+                return False
+        else:
+            # Handle HTTP URLs
+            httpx_client = ctx_httpx_client.get()
+            try:
+                async with (
+                    media_download_slot(url_screenhot) as timeout,
+                    httpx_client.stream(
+                        "GET", url_screenhot, timeout=timeout
+                    ) as response,
+                ):
+                    if response.status_code == status.HTTP_200_OK:
+                        if not _check_content_type(response, ("image/",), "screenshot"):
+                            return False
+
+                        # Check if content is gzipped from response headers
+                        is_gzipped = (
+                            response.headers.get("content-encoding", "").lower()
+                            == "gzip"
+                        )
+
+                        async with self.write_file_streamed(
+                            path=screenshot_path, filename=f"{idx}.jpg"
+                        ) as f:
+                            if is_gzipped:
+                                # Content is gzipped, decompress it
+                                content = await response.aread()
+                                try:
+                                    decompressed_content = gzip.decompress(content)
+                                    await f.write(decompressed_content)
+                                except gzip.BadGzipFile:
+                                    await f.write(content)
+                            else:
+                                # Content is not gzipped, stream directly
+                                async for chunk in response.aiter_raw():
+                                    await f.write(chunk)
+
+                        return True
+            except httpx2.TransportError as exc:
+                log.error(f"Unable to fetch screenshot at {url_screenhot}: {str(exc)}")
+                return False
+            except OSError as exc:
+                log.error(f"Unable to write screenshot for {url_screenhot}: {str(exc)}")
+                return False
+
+        return False
+
+    def _stored_screenshot_indexes(self, rom: Rom) -> set[str]:
+        """Screenshot indexes this rom already has on disk."""
+        full_path = self.validate_path(f"{rom.fs_resources_path}/screenshots")
+        return {path.stem for path in full_path.glob("*.jpg")}
+
+    def _get_screenshot_path(self, rom: Rom, idx: str) -> str:
+        """Returns rom cover filesystem path adapted to frontend folder structure
+
+        Args:
+            rom: Rom object
+            idx: index number of screenshot
+        """
+        return f"{rom.fs_resources_path}/screenshots/{idx}.jpg"
+
+    async def get_rom_screenshots(
+        self, rom: Rom, overwrite: bool, url_screenshots: list[str] | None
+    ) -> list[str]:
+        """Get rom screenshots from filesystem
+
+        Args:
+            rom: Rom object
+            overwrite: Whether to overwrite existing screenshots
+            url_screenshots: List of URLs to download screenshots from
+        Returns
+            List of paths to screenshots
+        """
+        if not url_screenshots:
+            return rom.path_screenshots or []
+
+        # Go by what is on disk, not what was recorded: an unchanged url set
+        # still has to replace whatever an earlier run failed to write.
+        stored = set() if overwrite else self._stored_screenshot_indexes(rom)
+
+        async def screenshot_path(idx: int, url_screenshot: str) -> str | None:
+            if str(idx) not in stored and not await self._store_screenshot(
+                rom, url_screenshot, idx
+            ):
+                return None
+            return self._get_screenshot_path(rom, str(idx))
+
+        paths = await gather_all(
+            *(screenshot_path(idx, url) for idx, url in enumerate(url_screenshots))
+        )
+        return [path for path in paths if path]
+
+    # Manuals
+    def manual_exists(self, rom: Rom) -> bool:
+        """Check if rom manual exists in filesystem
+
+        Args:
+            rom: Rom object
+        Returns
+            True if manual exists in filesystem else False
+        """
+        full_path = self.validate_path(f"{rom.fs_resources_path}/manual")
+        return any(
+            (full_path / f"{rom.id}{ext}").is_file()
+            for ext in ALLOWED_MANUAL_EXTENSIONS
+        )
+
+    async def _store_manual(self, rom: Rom, url_manual: str) -> None:
+        manual_path = f"{rom.fs_resources_path}/manual"
+        await self.make_directory(manual_path)
+
+        # Handle local-file URIs from metadata handlers (gamelist, LaunchBox)
+        if url_manual.startswith(LOCAL_FILE_SCHEMES):
+            try:
+                resolved = _resolve_local_file_uri(url_manual)
+                if resolved is None or not await AnyioPath(resolved).exists():
+                    log.warning(f"Manual file not found: {url_manual}")
+                    return None
+                await self.copy_file(
+                    resolved, f"{manual_path}/{rom.id}.pdf", allow_link=True
+                )
+            except Exception as exc:
+                log.error(f"Unable to copy manual file {url_manual}: {str(exc)}")
+                await self._discard_partial_file(f"{manual_path}/{rom.id}.pdf")
+                return None
+        else:
+            # Handle HTTP URL
+            httpx_client = ctx_httpx_client.get()
+            try:
+                async with (
+                    media_download_slot(url_manual) as timeout,
+                    httpx_client.stream("GET", url_manual, timeout=timeout) as response,
+                ):
+                    if response.status_code == status.HTTP_200_OK:
+                        if not _check_content_type(
+                            response,
+                            (
+                                "application/pdf",
+                                "application/force-download",
+                                "application/octet-stream",
+                            ),
+                            "manual",
+                        ):
+                            return None
+
+                        # Check if content is gzipped from response headers
+                        is_gzipped = (
+                            response.headers.get("content-encoding", "").lower()
+                            == "gzip"
+                        )
+
+                        async with self.write_file_streamed(
+                            path=manual_path, filename=f"{rom.id}.pdf"
+                        ) as f:
+                            if is_gzipped:
+                                # Decompress gzipped content
+                                content = await response.aread()
+                                try:
+                                    decompressed_content = gzip.decompress(content)
+                                    await f.write(decompressed_content)
+                                except gzip.BadGzipFile:
+                                    await f.write(content)
+                            else:
+                                # Content is not gzipped, stream directly
+                                async for chunk in response.aiter_raw():
+                                    await f.write(chunk)
+            except httpx2.TransportError as exc:
+                log.error(f"Unable to fetch manual at {url_manual}: {str(exc)}")
+                return None
+            except OSError as exc:
+                log.error(f"Unable to write manual for {url_manual}: {str(exc)}")
+                return None
+
+    def _get_manual_path(self, rom: Rom) -> str | None:
+        """Returns rom manual filesystem path adapted to frontend folder structure
+
+        Args:
+            rom: Rom object
+        """
+        full_path = self.validate_path(f"{rom.fs_resources_path}/manual")
+        candidates = [
+            candidate
+            for ext in ALLOWED_MANUAL_EXTENSIONS
+            if (candidate := full_path / f"{rom.id}{ext}").is_file()
+        ]
+        if not candidates:
+            return None
+
+        # Multiple allowed manuals can coexist (e.g. an uploaded `.md` and a
+        # redownloaded `.pdf`). Pick the most recently written one, breaking
+        # mtime ties by name so the result is deterministic.
+        newest = max(candidates, key=lambda p: (p.stat().st_mtime, p.name))
+        return str(newest.relative_to(self.base_path))
+
+    async def get_manual(
+        self, rom: Rom, overwrite: bool, url_manual: str | None
+    ) -> str | None:
+        if not url_manual or (not overwrite and self.manual_exists(rom)):
+            return rom.path_manual or None
+
+        # Download and store new manual
+        await self._store_manual(rom, url_manual)
+        return self._get_manual_path(rom)
+
+    async def remove_manual(self, rom: Rom) -> None:
+        await self.remove_directory(f"{rom.fs_resources_path}/manual")
+
+    # Retroachievements
+    async def store_ra_badge(self, url: str, path: str) -> None:
+        httpx_client = ctx_httpx_client.get()
+        directory, filename = os.path.split(path)
+
+        if await self.file_exists(path):
+            log.debug(f"Badge {path} already exists, skipping download")
+            return
+
+        try:
+            async with (
+                _ra_badge_limiter,
+                httpx_client.stream("GET", url, timeout=120) as response,
+            ):
+                if response.status_code == status.HTTP_200_OK:
+                    if not _check_content_type(response, ("image/",), "badge"):
+                        return
+
+                    async with self.write_file_streamed(
+                        path=directory, filename=filename
+                    ) as f:
+                        async for chunk in response.aiter_raw():
+                            await f.write(chunk)
+        except httpx2.TransportError as exc:
+            log.error(f"Unable to fetch badge at {url}: {str(exc)}")
+        except OSError as exc:
+            log.error(f"Unable to write badge for {url}: {str(exc)}")
+
+    async def store_ra_badges(self, achievements: Iterable[dict[str, Any]]) -> None:
+        """Fetch the normal and locked badge of every achievement."""
+        # Keyed by path, since achievements can share a badge image.
+        badges: dict[str, str] = {}
+        for ach in achievements:
+            for url_key, path_key in (
+                ("badge_url_lock", "badge_path_lock"),
+                ("badge_url", "badge_path"),
+            ):
+                if ach.get(url_key) and ach.get(path_key):
+                    badges.setdefault(ach[path_key], ach[url_key])
+
+        await gather_all(
+            *(self.store_ra_badge(url, path) for path, url in badges.items())
+        )
+
+    def get_ra_resources_path(self, platform_id: int, rom_id: int) -> str:
+        return os.path.join(
+            "roms",
+            str(platform_id),
+            str(rom_id),
+            "retroachievements",
+        )
+
+    def get_ra_badges_path(self, platform_id: int, rom_id: int) -> str:
+        return os.path.join(self.get_ra_resources_path(platform_id, rom_id), "badges")
+
+    # Mixed media
+    def get_media_resources_path(
+        self,
+        platform_id: int,
+        rom_id: int,
+        media_type: MetadataMediaType,
+    ) -> str:
+        return os.path.join("roms", str(platform_id), str(rom_id), media_type.value)
+
+    async def store_media_file(self, url_media: str, dest_path: str) -> bool:
+        """Fetch a media file into ``dest_path``.
+
+        Returns whether the file is on disk afterwards, so callers can stop
+        recording a path for media that never landed.
+        """
+        directory, filename = os.path.split(dest_path)
+
+        if await self.file_exists(dest_path):
+            log.debug(f"Media file {dest_path} already exists, skipping download")
+        else:
+            # Ensure destination directory exists
+            await self.make_directory(directory)
+
+            # Handle local-file URIs from metadata handlers (gamelist, LaunchBox)
+            if url_media.startswith(LOCAL_FILE_SCHEMES):
+                try:
+                    resolved = _resolve_local_file_uri(url_media)
+                    if resolved is not None and await AnyioPath(resolved).exists():
+                        await self.copy_file(resolved, dest_path, allow_link=True)
+                except Exception as exc:
+                    log.error(f"Unable to copy media file {url_media}: {str(exc)}")
+                    await self._discard_partial_file(dest_path)
+                    return False
+            else:
+                # Handle HTTP URLs
+                httpx_client = ctx_httpx_client.get()
+                try:
+                    async with (
+                        media_download_slot(url_media) as timeout,
+                        httpx_client.stream(
+                            "GET", url_media, timeout=timeout
+                        ) as response,
+                    ):
+                        if response.status_code == status.HTTP_200_OK:
+                            if not _check_content_type(
+                                response,
+                                ("image/", "video/", "application/pdf"),
+                                "media",
+                            ):
+                                return False
+
+                            async with self.write_file_streamed(
+                                path=directory, filename=filename
+                            ) as f:
+                                async for chunk in response.aiter_raw():
+                                    await f.write(chunk)
+                except httpx2.TransportError as exc:
+                    log.error(f"Unable to fetch media file at {url_media}: {str(exc)}")
+                    return False
+                except OSError as exc:
+                    log.error(f"Unable to write media file for {url_media}: {str(exc)}")
+                    return False
+
+        # Drop ScreenScraper's green "missing art" placeholder so a box face
+        # (box-2D / box-2D-back / box-2D-side) falls back to the dark placeholder
+        # rather than rendering bright green. Runs for pre-existing files too,
+        # cleaning them up on rescan.
+        if await self._discard_if_chroma_key(dest_path):
+            return False
+
+        # A non-200 response, or a local URI that resolved to nothing, leaves no
+        # file behind without raising.
+        return await self.file_exists(dest_path)
+
+    @staticmethod
+    def recorded_media(
+        metadata: dict[str, Any], media_types: Iterable[MetadataMediaType]
+    ) -> list[RecordedMedia]:
+        """Every media file a provider metadata dict records a path for.
+
+        Args:
+            metadata: The provider dict. Beside each ``<type>_path`` and
+                ``<type>_url``, a ``<type>_extra_discs`` list holds a ``path``
+                and ``url`` per later disc.
+            media_types: The types to look for; one listed twice counts once.
+
+        Returns:
+            One entry per recorded file.
+        """
+        recorded: list[RecordedMedia] = []
+        for media_type in dict.fromkeys(media_types):
+            path_key = f"{media_type.value}_path"
+            if metadata.get(path_key):
+                recorded.append(
+                    RecordedMedia(
+                        media_type,
+                        metadata,
+                        path_key,
+                        metadata.get(f"{media_type.value}_url"),
+                    )
+                )
+            recorded += [
+                RecordedMedia(media_type, disc, "path", disc.get("url"))
+                for disc in metadata.get(f"{media_type.value}_extra_discs") or []
+                if disc.get("path")
+            ]
+        return recorded
+
+    async def remove_recorded_media(
+        self,
+        platform_id: int,
+        rom_id: int,
+        metadata: dict[str, Any],
+        media_types: Iterable[MetadataMediaType],
+    ) -> None:
+        """Delete the media files a provider dict records for a rom.
+
+        Args:
+            platform_id: The rom's platform.
+            rom_id: The rom.
+            metadata: The provider dict whose files go.
+            media_types: The types to delete.
+        """
+        for media in self.recorded_media(metadata, media_types):
+            try:
+                if media.owner is metadata:
+                    await self.remove_media_resources_path(
+                        platform_id, rom_id, media.media_type
+                    )
+                else:
+                    # A later disc shares its type's folder with other
+                    # providers' files, so only the disc's own file goes.
+                    await self.remove_file(media.path)
+            except FileNotFoundError:
+                pass
+
+    async def remove_stale_media(
+        self,
+        previous: Sequence[dict[str, Any] | None],
+        current: Sequence[dict[str, Any] | None],
+        media_types: Iterable[MetadataMediaType],
+    ) -> None:
+        """Delete stored media whose owner or source changed, so it is fetched again.
+
+        Args:
+            previous: Every provider's dict before the scan, highest priority first.
+            current: The same providers' dicts about to be stored, in that order.
+            media_types: The types to compare.
+        """
+        media_types = list(media_types)
+
+        def claims(dicts: Sequence[dict[str, Any] | None]) -> dict[str, _PathClaim]:
+            # A shared path holds the file of the first provider that records it.
+            owned: dict[str, _PathClaim] = {}
+            for provider, metadata in enumerate(dicts):
+                for media in self.recorded_media(metadata or {}, media_types):
+                    owned.setdefault(media.path, _PathClaim(provider, media.url))
+            return owned
+
+        after = claims(current)
+        stale = [
+            path
+            for path, before in claims(previous).items()
+            # A current claim without a URL keeps what its provider stored.
+            if (claim := after.get(path)) is None
+            or claim.provider != before.provider
+            or claim.url not in (None, before.url)
+        ]
+        for path in stale:
+            try:
+                await self.remove_file(path)
+            except FileNotFoundError:
+                pass
+
+    async def store_metadata_media(
+        self,
+        metadata: dict[str, Any],
+        media_types: Iterable[MetadataMediaType],
+        url_transform: Callable[[str], str] | None = None,
+    ) -> bool:
+        """Fetch every recorded media file of a provider metadata dict.
+
+        Providers record where each media file should live before it's fetched,
+        so a failed download (or discarded placeholder art) would otherwise leave
+        the dict pointing at a file that isn't there. Every ``*_path`` left in the
+        dict afterwards points at a file that exists; the rest are cleared, and
+        the ``*_url`` is kept so a later scan can retry. Returns whether the dict
+        was modified.
+        """
+
+        async def store(media_path: str, media_url: str | None) -> bool:
+            if media_url:
+                return await self.store_media_file(
+                    url_transform(media_url) if url_transform else media_url,
+                    media_path,
+                )
+            # Nothing to fetch from, so the path only holds if an earlier
+            # scan already stored the file.
+            return await self.file_exists(media_path)
+
+        targets = self.recorded_media(metadata, media_types)
+        stored = await gather_all(*(store(media.path, media.url) for media in targets))
+        for media, ok in zip(targets, stored, strict=True):
+            if not ok:
+                media.owner[media.key] = None
+        return not all(stored)
+
+    async def remove_media_resources_path(
+        self,
+        platform_id: int,
+        rom_id: int,
+        media_type: MetadataMediaType,
+    ) -> None:
+        await self.remove_directory(
+            self.get_media_resources_path(platform_id, rom_id, media_type)
+        )

@@ -1,0 +1,26 @@
+# Configuration
+**/.env
+
+# Frontend
+**/assets/library/
+**/node_modules/
+# Fetched by the emulator stage; a dev container leaves symlinks here on the host
+frontend/assets/emulatorjs/*
+!frontend/assets/emulatorjs/*.svg
+frontend/assets/ruffle/*
+!frontend/assets/ruffle/*.svg
+!frontend/assets/ruffle/*.png
+frontend/assets/jsdos
+frontend/assets/pico8
+
+# Backend
+backend/tests/
+**/venv/
+**/.venv/
+**/.mypy_cache/
+**/.pytest_cache/
+**/__pycache__/
+
+# Testing
+**/romm_test/
+**/romm_mock/

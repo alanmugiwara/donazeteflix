@@ -1,0 +1,173 @@
+import logging
+import os
+import re
+from pprint import pformat
+
+from colorama import Fore, Style, init
+
+from config import FORCE_COLOR, LOGLEVEL, NO_COLOR
+
+RED = Fore.RED
+LIGHTRED = Fore.LIGHTRED_EX
+GREEN = Fore.GREEN
+LIGHTYELLOW = Fore.LIGHTYELLOW_EX
+YELLOW = Fore.YELLOW
+BLUE = Fore.BLUE
+CYAN = Fore.CYAN
+LIGHTMAGENTA = Fore.LIGHTMAGENTA_EX
+RESET = Fore.RESET
+RESET_ALL = Style.RESET_ALL
+
+LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "romm": {
+            "()": "logger.formatter.Formatter",
+        }
+    },
+    "handlers": {
+        "default": {
+            "formatter": "romm",
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+        }
+    },
+    "root": {
+        "handlers": ["default"],
+        "level": LOGLEVEL,
+    },
+    "loggers": {
+        "uvicorn": {
+            "level": LOGLEVEL,
+            "handlers": ["default"],
+            "propagate": False,
+        },
+        "uvicorn.error": {
+            "level": LOGLEVEL,
+            "handlers": ["default"],
+            "propagate": False,
+        },
+        "uvicorn.access": {
+            # Suppress HTTP access logs unless the user has explicitly opted into DEBUG logging.
+            "level": "DEBUG" if LOGLEVEL == "DEBUG" else "WARNING",
+            "handlers": ["default"],
+            "propagate": False,
+        },
+    },
+}
+
+
+# Strips ANSI SGR escapes (colors) embedded by `highlight()`; they render as
+# colors on a terminal but as garbage anywhere else (e.g. a browser log view).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI SGR (color) escape sequences from a string."""
+    return _ANSI_RE.sub("", text)
+
+
+def redact_sensitive(text: str) -> str:
+    """Mask sensitive values (api keys, tokens, …) in a log string.
+
+    The redaction regex lives in ``handler.metadata.base_handler``, which pulls
+    a heavy import chain that isn't importable during the first few boot lines —
+    skip redaction until it is, exactly like the Formatter does.
+    """
+    try:
+        from handler.metadata.base_handler import SENSITIVE_KEYS_REGEX
+    except ImportError:
+        return text
+    return SENSITIVE_KEYS_REGEX.sub(r"\1=***", text)
+
+
+def resolve_module_name(record: logging.LogRecord) -> str:
+    """Derive the semantic module name shown in logs.
+
+    Resolution order:
+    1. An explicit ``extra={"module_name": ...}`` on the log call — the manual
+       override (e.g. the scan handler groups all its lines under ``scan``).
+    2. The record's module: the source filename without its extension.
+    3. For package ``__init__`` files the bare filename carries no meaning
+       (``backend/endpoints/roms/__init__.py`` → ``__init__``); fall back to the
+       package — the parent directory name — so it reads as ``roms`` instead.
+    """
+    explicit = getattr(record, "module_name", None)
+    if explicit is not None:
+        return str(explicit)
+
+    module = record.module
+    if module == "__init__" and record.pathname:
+        parent = os.path.basename(os.path.dirname(record.pathname))
+        if parent:
+            return parent
+    return module
+
+
+def should_strip_ansi() -> bool:
+    """Determine if ANSI escape codes should be stripped."""
+    # Check if an explicit environment variable is set to control color behavior
+    if FORCE_COLOR:
+        return False
+    if NO_COLOR:
+        return True
+    # Default: do not strip (Docker will handle colors)
+    return False
+
+
+# Initialize Colorama once, considering different environments
+init(strip=should_strip_ansi())
+
+
+class Formatter(logging.Formatter):
+    """
+    Logger formatter.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        """
+        Formats a log record with color-coded output based on the log level.
+
+        Args:
+            record: The log record to format.
+
+        Returns:
+            The formatted log record as a string.
+        """
+        level = "%(levelname)s"
+        dots = f"{RESET}:"
+        module_label = resolve_module_name(record).lower()
+        identifier = f"\t  {BLUE}[RomM]{LIGHTMAGENTA}[{module_label}]"
+        identifier_warning = f"  {BLUE}[RomM]{LIGHTMAGENTA}[{module_label}]"
+        identifier_critical = f" {BLUE}[RomM]{LIGHTMAGENTA}[{module_label}]"
+        msg = f"{RESET_ALL}%(message)s"
+
+        message = pformat(record.msg) if hasattr(record, "pprint") else "%(message)s"
+        msg = f"{RESET_ALL}{message}"
+        date = f"{CYAN}[%(asctime)s] "
+        formats = {
+            logging.DEBUG: f"{LIGHTMAGENTA}{level}{dots}{identifier}{date}{msg}",
+            logging.INFO: f"{GREEN}{level}{dots}{identifier}{date}{msg}",
+            logging.WARNING: f"{YELLOW}{level}{dots}{identifier_warning}{date}{msg}",
+            logging.ERROR: f"{LIGHTRED}{level}{dots}{identifier}{date}{msg}",
+            logging.CRITICAL: f"{RED}{level}{dots}{identifier_critical}{date}{msg}",
+        }
+        log_fmt = formats.get(record.levelno)
+        formatter = logging.Formatter(fmt=log_fmt, datefmt="%Y-%m-%d %H:%M:%S")
+        output = formatter.format(record)
+        return redact_sensitive(output)
+
+
+def highlight(msg: str = "", color: str = YELLOW) -> str:
+    """
+    Highlights the message to send to the fancylog.
+
+    Args:
+        msg: Message to log.
+        color: Highlight with specific color. Available colors: RED, GREEN, YELLOW, BLUE.
+
+    Returns:
+        The highlighted message as a string.
+    """
+    return f"{color}{msg}{RESET_ALL}"

@@ -1,0 +1,142 @@
+"""Add created_at and updated_at columns
+
+Revision ID: 0020_created_and_updated
+Revises: 0019_resources_refactor
+Create Date: 2024-06-27 12:08:13.886766
+
+"""
+
+import sqlalchemy as sa
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision = "0020_created_and_updated"
+down_revision = "0019_resources_refactor"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    with op.batch_alter_table("firmware", schema=None) as batch_op:
+        batch_op.add_column(
+            sa.Column(
+                "created_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("now()"),
+                nullable=False,
+            ),
+            if_not_exists=True,
+        )
+        batch_op.add_column(
+            sa.Column(
+                "updated_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("now()"),
+                nullable=False,
+            ),
+            if_not_exists=True,
+        )
+
+    with op.batch_alter_table("platforms", schema=None) as batch_op:
+        batch_op.add_column(
+            sa.Column(
+                "created_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("now()"),
+                nullable=False,
+            ),
+            if_not_exists=True,
+        )
+        batch_op.add_column(
+            sa.Column(
+                "updated_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("now()"),
+                nullable=False,
+            ),
+            if_not_exists=True,
+        )
+
+    with op.batch_alter_table("rom_notes", schema=None) as batch_op:
+        batch_op.add_column(
+            sa.Column(
+                "created_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("now()"),
+                nullable=False,
+            ),
+            if_not_exists=True,
+        )
+        batch_op.alter_column(
+            "last_edited_at",
+            existing_type=sa.DateTime(timezone=True),
+            new_column_name="updated_at",
+            server_default=sa.text("now()"),
+            nullable=False,
+        )
+
+    with op.batch_alter_table("roms", schema=None) as batch_op:
+        batch_op.add_column(
+            sa.Column(
+                "created_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("now()"),
+                nullable=False,
+            ),
+            if_not_exists=True,
+        )
+        batch_op.add_column(
+            sa.Column(
+                "updated_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("now()"),
+                nullable=False,
+            ),
+            if_not_exists=True,
+        )
+
+    with op.batch_alter_table("users", schema=None) as batch_op:
+        batch_op.add_column(
+            sa.Column(
+                "created_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("now()"),
+                nullable=False,
+            ),
+            if_not_exists=True,
+        )
+        batch_op.add_column(
+            sa.Column(
+                "updated_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("now()"),
+                nullable=False,
+            ),
+            if_not_exists=True,
+        )
+
+
+def downgrade() -> None:
+    with op.batch_alter_table("users", schema=None) as batch_op:
+        batch_op.drop_column("updated_at", if_exists=True)
+        batch_op.drop_column("created_at", if_exists=True)
+
+    with op.batch_alter_table("roms", schema=None) as batch_op:
+        batch_op.drop_column("updated_at", if_exists=True)
+        batch_op.drop_column("created_at", if_exists=True)
+
+    with op.batch_alter_table("rom_notes", schema=None) as batch_op:
+        batch_op.alter_column(
+            "updated_at",
+            existing_type=sa.DateTime(timezone=True),
+            new_column_name="last_edited_at",
+            nullable=False,
+        )
+
+    with op.batch_alter_table("platforms", schema=None) as batch_op:
+        batch_op.drop_column("updated_at", if_exists=True)
+        batch_op.drop_column("created_at", if_exists=True)
+
+    with op.batch_alter_table("firmware", schema=None) as batch_op:
+        batch_op.drop_column("updated_at", if_exists=True)
+        batch_op.drop_column("created_at", if_exists=True)

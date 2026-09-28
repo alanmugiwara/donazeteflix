@@ -1,0 +1,11 @@
+/* generated using openapi-typescript-codegen -- do not edit */
+/* istanbul ignore file */
+/* tslint:disable */
+/* eslint-disable */
+export type EmulationDict = {
+    DISABLE_EMULATOR_JS: boolean;
+    DISABLE_RUFFLE_RS: boolean;
+    DISABLE_JSDOS: boolean;
+    DISABLE_PICO8: boolean;
+};
+

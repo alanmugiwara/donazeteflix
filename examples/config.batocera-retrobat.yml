@@ -1,0 +1,32 @@
+# This config file is compatible with Batocera or Retrobat-based set-ups
+# Rename this file to `config.yml`, copy it to a `config` folder, and mount that folder as per the docker-compose.example.yml
+# Only uncomment the lines you want to use/modify, or add new ones where needed
+exclude:
+  platforms: []
+  roms:
+    multi_file:
+      names: ["images", "videos"]
+      parts:
+        extensions: []
+        names: []
+    single_file:
+      extensions:
+        - xml
+        - txt
+      names: []
+filesystem: {}
+system:
+  # Batocera and RetroBat folder names are recognised automatically. The entries
+  # below override folders RomM would otherwise match to their own platform.
+  platforms:
+    atari800: atari8bit
+    model2: arcade
+    model3: arcade
+    pico: sega-pico
+  versions: {}
+scan:
+  gamelist:
+    export: true
+    media:
+      thumbnail: box3d
+      image: miximage

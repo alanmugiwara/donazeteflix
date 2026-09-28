@@ -1,0 +1,215 @@
+from collections.abc import Sequence
+from datetime import datetime, timezone
+
+from sqlalchemy import delete, select, update
+from sqlalchemy.orm import Session
+
+from decorators.database import INJECTED_SESSION, begin_session
+from models.assets import CONTENT_HASH_MAX_LENGTH
+from models.device import Device
+from models.device_save_sync import DeviceSaveSync
+
+from .base_handler import DBBaseHandler
+
+
+def _clean_hash(value: str | None) -> str | None:
+    """Absent, empty and over-long hashes all mean unknown."""
+    if not value or len(value) > CONTENT_HASH_MAX_LENGTH:
+        return None
+    return value
+
+
+class DBDeviceSaveSyncHandler(DBBaseHandler):
+    @begin_session
+    def get_sync(
+        self,
+        device_id: str,
+        save_id: int,
+        session: Session = INJECTED_SESSION,
+    ) -> DeviceSaveSync | None:
+        return session.scalar(
+            select(DeviceSaveSync)
+            .filter_by(device_id=device_id, save_id=save_id)
+            .limit(1)
+        )
+
+    @begin_session
+    def get_syncs_for_device_and_saves(
+        self,
+        device_id: str,
+        save_ids: list[int],
+        session: Session = INJECTED_SESSION,
+    ) -> Sequence[DeviceSaveSync]:
+        if not save_ids:
+            return []
+        return session.scalars(
+            select(DeviceSaveSync).filter(
+                DeviceSaveSync.device_id == device_id,
+                DeviceSaveSync.save_id.in_(save_ids),
+            )
+        ).all()
+
+    @begin_session
+    def get_syncs_for_saves(
+        self,
+        save_ids: list[int],
+        session: Session = INJECTED_SESSION,
+    ) -> dict[int, list[tuple[DeviceSaveSync, str | None]]]:
+        """Fetch every device sync row for the given saves, grouped by save id.
+
+        Each row is paired with its device name so callers can attribute a save
+        to the device that created it without triggering the lazy-raise
+        ``DeviceSaveSync.device`` relationship.
+        """
+        if not save_ids:
+            return {}
+        rows = session.execute(
+            select(DeviceSaveSync, Device.name)
+            .join(Device, DeviceSaveSync.device_id == Device.id)
+            .filter(DeviceSaveSync.save_id.in_(save_ids))
+            .order_by(DeviceSaveSync.last_synced_at.desc(), DeviceSaveSync.device_id)
+        ).all()
+        grouped: dict[int, list[tuple[DeviceSaveSync, str | None]]] = {}
+        for sync, device_name in rows:
+            grouped.setdefault(sync.save_id, []).append((sync, device_name))
+        return grouped
+
+    @begin_session
+    def upsert_sync(
+        self,
+        device_id: str,
+        save_id: int,
+        synced_at: datetime | None = None,
+        last_sync_hash: str | None = None,
+        last_sync_server_hash: str | None = None,
+        session: Session = INJECTED_SESSION,
+    ) -> DeviceSaveSync:
+        now = synced_at or datetime.now(timezone.utc)
+        client_hash = _clean_hash(last_sync_hash)
+        server_hash = _clean_hash(last_sync_server_hash)
+        existing = session.scalar(
+            select(DeviceSaveSync)
+            .filter_by(device_id=device_id, save_id=save_id)
+            .limit(1)
+        )
+        if existing:
+            session.execute(
+                update(DeviceSaveSync)
+                .where(
+                    DeviceSaveSync.device_id == device_id,
+                    DeviceSaveSync.save_id == save_id,
+                )
+                .values(
+                    last_synced_at=now,
+                    is_untracked=False,
+                    last_sync_hash=client_hash,
+                    last_sync_server_hash=server_hash,
+                )
+                .execution_options(synchronize_session="evaluate")
+            )
+            existing.last_synced_at = now
+            existing.is_untracked = False
+            existing.last_sync_hash = client_hash
+            existing.last_sync_server_hash = server_hash
+            return existing
+        else:
+            sync = DeviceSaveSync(
+                device_id=device_id,
+                save_id=save_id,
+                last_synced_at=now,
+                is_untracked=False,
+                last_sync_hash=client_hash,
+                last_sync_server_hash=server_hash,
+            )
+            session.add(sync)
+            session.flush()
+            return sync
+
+    @begin_session
+    def record_identical_content(
+        self,
+        device_id: str,
+        save_id: int,
+        content_hash: str | None,
+        synced_at: datetime | None = None,
+        session: Session = INJECTED_SESSION,
+    ) -> None:
+        """Record both sides holding ``content_hash``, unless untracked or already recorded."""
+        content_hash = _clean_hash(content_hash)
+        if not content_hash:
+            return
+        existing = self.get_sync(device_id, save_id, session=session)
+        if existing and (
+            existing.is_untracked
+            or (
+                existing.last_sync_hash == content_hash
+                and existing.last_sync_server_hash == content_hash
+            )
+        ):
+            return
+        self.upsert_sync(
+            device_id,
+            save_id,
+            synced_at=synced_at,
+            last_sync_hash=content_hash,
+            last_sync_server_hash=content_hash,
+            session=session,
+        )
+
+    @begin_session
+    def set_untracked(
+        self,
+        device_id: str,
+        save_id: int,
+        untracked: bool,
+        session: Session = INJECTED_SESSION,
+    ) -> DeviceSaveSync | None:
+        existing = session.scalar(
+            select(DeviceSaveSync)
+            .filter_by(device_id=device_id, save_id=save_id)
+            .limit(1)
+        )
+        if existing:
+            # While a save is untracked both sides can move, so the boundary
+            # recorded before it is no longer a statement about either side.
+            session.execute(
+                update(DeviceSaveSync)
+                .where(
+                    DeviceSaveSync.device_id == device_id,
+                    DeviceSaveSync.save_id == save_id,
+                )
+                .values(
+                    is_untracked=untracked,
+                    last_sync_hash=None,
+                    last_sync_server_hash=None,
+                )
+                .execution_options(synchronize_session="evaluate")
+            )
+            existing.is_untracked = untracked
+            existing.last_sync_hash = None
+            existing.last_sync_server_hash = None
+            return existing
+        elif untracked:
+            now = datetime.now(timezone.utc)
+            sync = DeviceSaveSync(
+                device_id=device_id,
+                save_id=save_id,
+                last_synced_at=now,
+                is_untracked=True,
+            )
+            session.add(sync)
+            session.flush()
+            return sync
+        return None
+
+    @begin_session
+    def delete_syncs_for_device(
+        self,
+        device_id: str,
+        session: Session = INJECTED_SESSION,
+    ) -> None:
+        session.execute(
+            delete(DeviceSaveSync)
+            .where(DeviceSaveSync.device_id == device_id)
+            .execution_options(synchronize_session="evaluate")
+        )

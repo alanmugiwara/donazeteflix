@@ -1,0 +1,69 @@
+# This config file is compatible with the ES-DE Emulation Frontend
+# Rename this file to `config.yml`, copy it to a `config` folder, and mount that folder as per the docker-compose.example.yml
+# Only uncomment the lines you want to use/modify, or add new ones where needed
+
+exclude:
+  roms:
+    single_file:
+      extensions:
+        - "xml"
+        - "txt"
+      names:
+        - "info.txt"
+        - "metadata.txt"
+        - "systeminfo.txt"
+        - "psy.ggjud.iso"
+        - "psy.ggjud.nfo"
+    multi_file:
+      names:
+        - "roms"
+        - "pfx"
+        - "mlc01"
+        - ".Trash*"
+
+system:
+  # ES-DE folder names are recognised automatically. The entry below overrides a
+  # folder RomM would otherwise match to its own platform.
+  platforms:
+    atari800: "atari8bit" # Atari 8-bit
+
+scan:
+  # Metadata priority during scans
+  priority:
+    # Below are the default priority values used
+    metadata: # Top-level metadata source priority
+      - "gamelist" # ES-DE gamelist.xml
+      - "igdb" # IGDB (highest priority)
+      - "moby" # MobyGames
+      - "ss" # Screenscraper
+      - "ra" # RetroAchievements
+      - "launchbox" # Launchbox
+      - "hasheous" # Hasheous
+      - "flashpoint" # Flashpoint Project
+      - "steam" # Steam (PC platforms only)
+      - "hltb" # HowLongToBeat (lowest priority)
+    artwork: # Cover art and screenshots
+      - "gamelist" # ES-DE gamelist.xml
+      - "igdb" # IGDB
+      - "moby" # MobyGames
+      - "ss" # Screenscraper
+      - "ra" # RetroAchievements
+      - "launchbox" # Launchbox
+      - "hasheous" # Hasheous
+      - "flashpoint" # Flashpoint Project
+      - "steam" # Steam (PC platforms only)
+      - "hltb" # HowLongToBeat
+  # Media assets to download
+  media:
+    # Used as alternative cover art
+    - box2d # Normal cover art (always enabled)
+    - box3d # 3D box art
+    - miximage # Mixed image of multiple media
+    - physical # Disc, cartridge, etc.
+    # Added to the screenshots carousel
+    - screenshot # Screenshot (enabled by default)
+    - title_screen # Title screen
+    - marquee # Transparent logo
+    - fanart # User uploaded artwork
+    # Gameplay video
+    - video # Video (warning: large file size)

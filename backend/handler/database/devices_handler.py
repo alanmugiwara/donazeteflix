@@ -1,0 +1,186 @@
+from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import delete, select, update
+from sqlalchemy.orm import Session
+
+from decorators.database import INJECTED_SESSION, begin_session
+from models.device import Device, SyncMode
+from utils.datetime import to_utc
+
+from .base_handler import DBBaseHandler
+
+LAST_SEEN_DEBOUNCE = timedelta(minutes=5)
+
+
+class DBDevicesHandler(DBBaseHandler):
+    @begin_session
+    def add_device(
+        self,
+        device: Device,
+        session: Session = INJECTED_SESSION,
+    ) -> Device:
+        return session.merge(device)
+
+    @begin_session
+    def get_device(
+        self,
+        device_id: str,
+        user_id: int,
+        session: Session = INJECTED_SESSION,
+    ) -> Device | None:
+        return session.scalar(
+            select(Device).filter_by(id=device_id, user_id=user_id).limit(1)
+        )
+
+    @begin_session
+    def get_device_by_fingerprint(
+        self,
+        user_id: int,
+        mac_address: str | None = None,
+        hostname: str | None = None,
+        ip_address: str | None = None,
+        platform: str | None = None,
+        session: Session = INJECTED_SESSION,
+    ) -> Device | None:
+        if mac_address:
+            device = session.scalar(
+                select(Device)
+                .filter_by(user_id=user_id, mac_address=mac_address)
+                .limit(1)
+            )
+            if device:
+                return device
+
+        if ip_address and platform:
+            return session.scalar(
+                select(Device)
+                .filter_by(user_id=user_id, ip_address=ip_address, platform=platform)
+                .limit(1)
+            )
+
+        if hostname and platform:
+            return session.scalar(
+                select(Device)
+                .filter_by(user_id=user_id, hostname=hostname, platform=platform)
+                .limit(1)
+            )
+
+        return None
+
+    @begin_session
+    def get_device_by_id(
+        self,
+        device_id: str,
+        session: Session = INJECTED_SESSION,
+    ) -> Device | None:
+        """Get a device by ID without user filtering (for server-side operations)."""
+        return session.scalar(select(Device).filter_by(id=device_id).limit(1))
+
+    @begin_session
+    def get_device_by_client_identifier(
+        self,
+        user_id: int,
+        client_device_identifier: str,
+        session: Session = INJECTED_SESSION,
+    ) -> Device | None:
+        """Find a device by its client-supplied stable identifier, scoped to a user."""
+        if not client_device_identifier:
+            return None
+        return session.scalar(
+            select(Device)
+            .filter_by(
+                user_id=user_id,
+                client_device_identifier=client_device_identifier,
+            )
+            .limit(1)
+        )
+
+    @begin_session
+    def get_devices(
+        self,
+        user_id: int,
+        session: Session = INJECTED_SESSION,
+    ) -> Sequence[Device]:
+        return session.scalars(select(Device).filter_by(user_id=user_id)).all()
+
+    @begin_session
+    def get_all_devices_by_sync_mode(
+        self,
+        sync_mode: SyncMode,
+        session: Session = INJECTED_SESSION,
+    ) -> Sequence[Device]:
+        """Get all devices with a specific sync mode (across all users)."""
+        return session.scalars(select(Device).filter_by(sync_mode=sync_mode)).all()
+
+    @begin_session
+    def update_device(
+        self,
+        device_id: str,
+        user_id: int,
+        data: dict[str, Any],
+        session: Session = INJECTED_SESSION,
+    ) -> Device | None:
+        session.execute(
+            update(Device)
+            .where(Device.id == device_id, Device.user_id == user_id)
+            .values(**data)
+            .execution_options(synchronize_session="evaluate")
+        )
+        return session.scalar(
+            select(Device).filter_by(id=device_id, user_id=user_id).limit(1)
+        )
+
+    @begin_session
+    def update_last_seen(
+        self,
+        device_id: str,
+        user_id: int,
+        session: Session = INJECTED_SESSION,
+    ) -> None:
+        session.execute(
+            update(Device)
+            .where(Device.id == device_id, Device.user_id == user_id)
+            .values(last_seen=datetime.now(timezone.utc))
+            .execution_options(synchronize_session="evaluate")
+        )
+
+    @begin_session
+    def update_last_seen_debounced(
+        self,
+        device_id: str,
+        session: Session = INJECTED_SESSION,
+    ) -> None:
+        """Bump last_seen on the device, skipping if updated within the debounce window.
+
+        Intended for the auth hot path -- called on every authenticated client-token
+        request. Mirrors the debounce used by ClientToken.update_last_used.
+        """
+        now = datetime.now(timezone.utc)
+        device = session.get(Device, device_id)
+        if device is None:
+            return
+
+        if device.last_seen and (now - to_utc(device.last_seen)) < LAST_SEEN_DEBOUNCE:
+            return
+
+        session.execute(
+            update(Device)
+            .where(Device.id == device_id)
+            .values(last_seen=now)
+            .execution_options(synchronize_session="evaluate")
+        )
+
+    @begin_session
+    def delete_device(
+        self,
+        device_id: str,
+        user_id: int,
+        session: Session = INJECTED_SESSION,
+    ) -> None:
+        session.execute(
+            delete(Device)
+            .where(Device.id == device_id, Device.user_id == user_id)
+            .execution_options(synchronize_session="evaluate")
+        )
