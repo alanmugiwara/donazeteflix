@@ -1,0 +1,66 @@
+volumes:
+    donazetflix_mysql_data:
+    donazetflix_resources:
+    donazetflix_redis_data:
+    donazetflix_assets:
+    donazetflix_config:
+
+services:
+    donazetflix:
+        image: docker.io/alanmugiwara/donazeteflix:0.1
+        container_name: donazetflix-app
+        restart: unless-stopped
+        environment:
+            - DB_HOST=donazetflix-db
+            - DB_NAME=donazetflix
+            - DB_USER=donazetflix
+            - DB_PASSWD=${DB_PASSWD}
+            - ROMM_AUTH_SECRET_KEY=${ROMM_AUTH_SECRET_KEY} # run on terminal "openssl rand -hex 32"
+            - SCREENSCRAPER_USER=${SCREENSCRAPER_USER}
+            - SCREENSCRAPER_PASSWORD=${SCREENSCRAPER_PASSWD}
+            - SCREENSCRAPER_DEV_ID=${SCREENSCRAPER_DEV_ID}
+            - SCREENSCRAPER_DEV_PASSWORD=${SCREENSCRAPER_DEV_PASSWD}
+            - RETROACHIEVEMENTS_API_KEY=${RETROACHIEVEMENTS_API_KEY}
+            - STEAMGRIDDB_API_KEY=${STEAMGRIDDB_API_KEY}
+            - HASHEOUS_API_ENABLED=true
+            - PLAYMATCH_API_ENABLED=true
+            - LAUNCHBOX_API_ENABLED=true
+            - ENABLE_SCHEDULED_UPDATE_LAUNCHBOX_METADATA=true
+            - HLTB_API_ENABLED=true
+            - IGDB_CLIENT_ID=${IGDB_CLIENT_ID}
+            - IGDB_CLIENT_SECRET=${IGDB_CLIENT_SECRET}
+            - ENABLED_PROVIDERS=igdb,screenscraper,retroachievements,steamgriddb,hasheous,playmatch,launchbox
+
+        volumes:
+            - donazetflix_resources:/romm/resources # Volume nomeado | Resources fetched from IGDB (covers, screenshots, etc.)
+            - donazetflix_redis_data:/redis-data # Volume nomeado Cached data for background tasks
+            - ${DONAZETFLIX_LIBRARY}:/romm/library # Bind-mount | Your game library. Check https://github.com/rommapp for more details.
+            - ${DONAZETFLIX_ASSETS}:/romm/assets # Volume nomeado | Uploaded saves, states, etc.
+            - ${DONAZETFLIX_CONFIG}:/romm/config # Volume nomeado | Path where config.yml is stored
+        ports:
+            - 8081:8080
+        depends_on:
+            donazetflix-db:
+                condition: service_healthy
+                restart: true
+        mem_limit: 2512m
+
+    donazetflix-db:
+        image: docker.io/mariadb:latest
+        container_name: donazetflix-db
+        restart: unless-stopped
+        environment:
+            - MARIADB_ROOT_PASSWORD=${MARIADB_ROOT_PASSWD}
+            - MARIADB_DATABASE=donazetflix
+            - MARIADB_USER=donazetflix
+            - MARIADB_PASSWORD=${DB_PASSWD}
+        volumes:
+            - donazetflix_mysql_data:/var/lib/mysql
+        healthcheck:
+            test: [CMD, healthcheck.sh, --connect, --innodb_initialized]
+            start_period: 30s
+            start_interval: 10s
+            interval: 10s
+            timeout: 5s
+            retries: 5
+        mem_limit: 512m
