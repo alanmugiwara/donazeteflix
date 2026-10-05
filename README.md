@@ -3,8 +3,8 @@
 [![License](https://img.shields.io/badge/License-GPL--3.0-8A2BE2?style=for-the-badge)](https://github.com/alanmugiwara/donazeteflix?tab=AGPL-3.0-1-ov-file)
 [![Create Date](https://img.shields.io/badge/created%20on-set%2028,%202026-8A2BE2?style=for-the-badge)](https://github.com/alanmugiwara/donazeteflix)
 [![Last update](https://img.shields.io/github/last-commit/alanmugiwara/donazeteflix?color=8A2BE2&label=Last%20Commit&style=for-the-badge)](https://github.com/alanmugiwara/donazeteflix)
-[![Contributors](https://img.shields.io/github/contributors/alanmugiwara/donazeteflix?color=8A2BE2&style=for-the-badge)](https://github.com/alanmugiwara/donazeteflix)
-[![Issues Counter](https://img.shields.io/github/issues/alanmugiwara/donazeteflix?color=8A2BE2&style=for-the-badge)](https://github.com/alanmugiwara/donazeteflix)
+[![Contributors](https://img.shields.io/github/contributors/alanmugiwara/donazeteflix?color=8A2BE2&style=for-the-badge)](https://github.com/alanmugiwara/donazeteflix/graphs/contributors)
+[![Issues Counter](https://img.shields.io/github/issues/alanmugiwara/donazeteflix?color=8A2BE2&style=for-the-badge)](https://github.com/alanmugiwara/donazeteflix/issues)
 [![Repo Size](https://img.shields.io/github/repo-size/alanmugiwara/donazeteflix?color=8A2BE2&style=for-the-badge)](https://github.com/alanmugiwara/donazeteflix)
 [![Docker Image Size](https://img.shields.io/docker/image-size/alanmugiwara/donazeteflix?color=8A2BE2&style=for-the-badge)](https://hub.docker.com/r/alanmugiwara/donazeteflix)
 
