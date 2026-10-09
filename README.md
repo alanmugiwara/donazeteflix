@@ -144,7 +144,7 @@ A imagem está publicada no Docker Hub:
 
 ## Building e criação da sua própria imagem
 
-- Baixe este redpositório e entre no diretório do projeto
+- Baixe este repositório e entre no diretório do projeto
 ``` bash
 git clone https://github.com/alanmugiwara/donazeteflix \
 && cd donazeteflix
