@@ -140,8 +140,7 @@ A imagem está publicada no Docker Hub:
 - LaunchBox
 - HowLongToBeat (HLTB)
 
----alanmugiwara/donazeteflix:0.1
-SEU-USUARIO/NOME-DO-SEU-PROJETO:VERSAO-DO-PROJETO \
+---
 
 ## Building e criação da sua própria imagem
 

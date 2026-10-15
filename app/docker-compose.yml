@@ -7,7 +7,7 @@ volumes:
 
 services:
     donazetflix:
-        image: docker.io/alanmugiwara/donazeteflix:0.1
+        image: docker.io/alanmugiwara/donazeteflix:0.2
         container_name: donazetflix-app
         restart: unless-stopped
         environment:
