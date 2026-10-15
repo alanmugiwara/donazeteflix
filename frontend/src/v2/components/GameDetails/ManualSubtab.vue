@@ -14,12 +14,11 @@ import { useI18n } from "vue-i18n";
 import romApi from "@/services/api/rom";
 import type { DetailedRom } from "@/stores/roms";
 import type { Events } from "@/types/emitter";
-import { FRONTEND_RESOURCES_PATH } from "@/utils";
 import { useCan } from "@/v2/composables/useCan";
 import { useRomSync } from "@/v2/composables/useRomSync";
 import { useSnackbar } from "@/v2/composables/useSnackbar";
 import { errorMessage } from "@/v2/utils/errorMessage";
-import { versionedRomFileUrl } from "@/v2/utils/romFiles";
+import { versionedResourceUrl, versionedRomFileUrl } from "@/v2/utils/romFiles";
 
 const PdfViewer = defineAsyncComponent(
   () => import("@/v2/components/GameDetails/PdfViewer.vue"),
@@ -71,12 +70,11 @@ const kindFor = (name: string): ManualEntry["kind"] => {
 
 const manualEntries = computed<ManualEntry[]>(() => {
   const entries: ManualEntry[] = [];
-  const cacheBust = encodeURIComponent(props.rom.updated_at);
   if (props.rom.has_manual && props.rom.path_manual) {
     entries.push({
       id: "primary",
       label: t("rom.scraped-manual"),
-      url: `${FRONTEND_RESOURCES_PATH}/${props.rom.path_manual}?v=${cacheBust}`,
+      url: versionedResourceUrl(props.rom.path_manual, props.rom.updated_at),
       isPrimary: true,
       fileId: null,
       kind: kindFor(props.rom.path_manual),
@@ -111,9 +109,9 @@ watch(
       // lands on the manual they just uploaded.
       const added = entries.filter((e) => !previousManualIds.has(e.id));
       if (added.length > 0 && previousManualIds.size > 0) {
-        selectedManualId.value = added[added.length - 1].id;
+        selectedManualId.value = added[added.length - 1]!.id;
       } else if (!entries.some((e) => e.id === selectedManualId.value)) {
-        selectedManualId.value = entries[0].id;
+        selectedManualId.value = entries[0]!.id;
       }
     }
     previousManualIds = currentIds;

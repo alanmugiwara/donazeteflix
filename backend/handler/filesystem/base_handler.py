@@ -20,7 +20,6 @@ from starlette.datastructures import UploadFile
 
 from config.config_manager import config_manager as cm
 from models.base import (
-    FILE_NAME_MAX_LENGTH,
     compute_file_extension,
     compute_file_name_no_ext,
     compute_file_name_no_tags,
@@ -28,6 +27,8 @@ from models.base import (
 from utils.filesystem import (
     LINK_FALLBACK_ERRNOS,
     SERVED_FILE_MODE,
+    TEMP_FILE_PREFIX,
+    check_filename_length,
     iter_directories,
     iter_files,
     link_or_copy_file,
@@ -375,7 +376,6 @@ class FSHandler:
         self.base_path = Path(base_path).resolve()
         self._locks: dict[str, asyncio.Lock] = {}
         self._lock_mutex = asyncio.Lock()
-        self.base_path.mkdir(parents=True, exist_ok=True)
 
     async def _get_file_lock(self, file_path: str) -> asyncio.Lock:
         """Get or create a lock for a specific file path."""
@@ -392,11 +392,7 @@ class FSHandler:
         # Remove path components and get basename only
         filename = os.path.basename(filename)
 
-        # Limit filename length
-        if len(filename) > FILE_NAME_MAX_LENGTH:
-            raise ValueError(
-                f"Filename {filename} exceeds maximum length of {FILE_NAME_MAX_LENGTH} characters"
-            )
+        check_filename_length(filename)
 
         # Ensure we have a valid filename
         if not filename or filename == "." or filename == "..":
@@ -455,6 +451,25 @@ class FSHandler:
 
         return full_path
 
+    def cached_path_validator(self) -> Callable[[str], Path]:
+        """Return a `validate_path` that checks each parent directory once per callable."""
+        validated_dirs: dict[Path, Path] = {}
+
+        def validate(path: str) -> Path:
+            rel_path = Path(path)
+            if ".." in rel_path.parts or rel_path.is_absolute() or not rel_path.name:
+                return self.validate_path(path)
+
+            parent = rel_path.parent
+            full_dir = validated_dirs.get(parent)
+            if full_dir is None:
+                full_dir = validated_dirs[parent] = self.validate_path(str(parent))
+            # validate_path accepts a symlinked leaf, and a plain leaf resolves
+            # inside its already checked directory, so the leaf needs no syscall.
+            return full_dir / rel_path.name
+
+        return validate
+
     async def _compute_file_hash(self, file_path: str) -> str:
         full_path = self.validate_path(file_path)
 
@@ -482,7 +497,7 @@ class FSHandler:
         final os.replace() occurs on the same filesystem.
         """
         fd, temp_path_str = tempfile.mkstemp(
-            dir=str(target_path.parent), prefix=".romm_tmp_"
+            dir=str(target_path.parent), prefix=TEMP_FILE_PREFIX
         )
         temp_path = Path(temp_path_str)
         os.close(fd)

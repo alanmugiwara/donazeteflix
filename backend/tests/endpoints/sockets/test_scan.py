@@ -1,3 +1,4 @@
+import asyncio
 import time
 from types import SimpleNamespace
 from typing import cast
@@ -5,18 +6,20 @@ from unittest.mock import AsyncMock, MagicMock, Mock, PropertyMock
 
 import pytest
 import socketio
+from rq import Worker
 from rq.exceptions import (
     AbandonedJobError,
     DeserializationError,
     InvalidJobOperation,
 )
-from rq.job import JobStatus
+from rq.job import Job, JobStatus
 from rq.timeouts import JobTimeoutException
 from tests.scan_job_stubs import (
     NON_SCAN_FUNC,
     make_job,
     make_scoped_job,
     make_task_job,
+    patch_held_scan_request_lock,
     patch_scan_jobs,
 )
 
@@ -25,7 +28,9 @@ from endpoints.responses.platform import PlatformSchema
 from endpoints.responses.rom import SimpleRomSchema
 from endpoints.sockets import scan as scan_module
 from endpoints.sockets.scan import (
+    ScanPayload,
     ScanStats,
+    _ancestor_paths,
     _identify_rom,
     _scan_selected_roms,
     _should_extract_title_ids,
@@ -53,7 +58,7 @@ from handler.filesystem.roms_handler import (
     ParsedTags,
 )
 from handler.metadata import meta_gamelist_handler
-from handler.redis_handler import scan_queue
+from handler.redis_handler import async_cache, redis_lock, scan_queue
 from handler.rom_files import RomFilesRefresh
 from handler.scan_handler import MetadataSource, ScanType
 from handler.scan_jobs import SCAN_PLATFORMS_FUNC
@@ -1208,6 +1213,52 @@ class TestIdentifyRomReassociation:
         created = db.add_rom.call_args_list[0].args[0]
         assert isinstance(created, Rom)
         assert created.fs_name == "New Name.zip"
+        # Hashes without listed files are not inserted.
+        assert created.crc_hash is None
+        assert created.fs_size_bytes is None
+        assert created.title_id is None
+
+    async def test_new_entry_is_inserted_with_hashes(self, patched, mocker):
+        db, platform = patched
+        db.get_matching_missing_rom.return_value = None
+        mocker.patch.object(
+            fs_rom_handler,
+            "get_rom_files",
+            AsyncMock(
+                return_value=ParsedRomFiles(
+                    rom_files=[
+                        RomFile(
+                            file_name="New Name.zip",
+                            file_path="test/roms",
+                            file_size_bytes=1024,
+                        ),
+                        RomFile(
+                            file_name="New Name [DLC].zip",
+                            file_path="test/roms",
+                            file_size_bytes=512,
+                        ),
+                    ],
+                    crc_hash="crc",
+                    md5_hash="md5",
+                    sha1_hash="sha1",
+                    ra_hash="ra",
+                    identity=RomIdentity(title_id="0100ABCD12340000"),
+                )
+            ),
+        )
+
+        await self._run(platform)
+
+        created = db.add_rom.call_args_list[0].args[0]
+        expected = {
+            "crc_hash": "crc",
+            "md5_hash": "md5",
+            "sha1_hash": "sha1",
+            "ra_hash": "ra",
+            "fs_size_bytes": 1536,
+            "title_id": "0100ABCD12340000",
+        }
+        assert {key: getattr(created, key) for key in expected} == expected
 
 
 class TestIdentifyRomTitleIdEmbedRename:
@@ -1382,6 +1433,100 @@ class TestIdentifyPlatformMarksMissingBeforeScan:
         assert calls.index("mark_missing") < calls.index("identify")
 
 
+class TestIdentifyPlatformSupersededFolders:
+    """A missing entry whose path is an ancestor of a discovered ROM is flagged as superseded."""
+
+    async def test_flags_only_entries_holding_discovered_roms(self, mocker):
+        mocker.patch.object(
+            scan_module, "redis_client", Mock(get=Mock(return_value=None))
+        )
+
+        platform = Platform(name="Test", slug="test", fs_slug="test")
+        platform.id = 1
+        platform.missing_from_fs = False
+        db_platform = mocker.patch.object(scan_module, "db_platform_handler")
+        db_platform.get_platform_by_fs_slug.return_value = platform
+        db_platform.add_platform.return_value = platform
+
+        mocker.patch.object(
+            scan_module, "scan_platform", AsyncMock(return_value=platform)
+        )
+        mocker.patch.object(
+            PlatformSchema,
+            "model_validate",
+            return_value=Mock(model_dump=Mock(return_value={})),
+        )
+        mocker.patch.object(
+            fs_firmware_handler,
+            "get_firmware",
+            AsyncMock(return_value=[]),
+        )
+
+        fs_roms = [
+            make_fs_rom("Game.zip", "test/roms/Collection"),
+            make_fs_rom("Game.zip", "test/roms/Bundle/"),
+            make_fs_rom("Game.zip", "test/roms/Saga Deluxe"),
+        ]
+        mocker.patch.object(fs_rom_handler, "get_roms", AsyncMock(return_value=fs_roms))
+
+        db_rom = mocker.patch.object(scan_module, "db_rom_handler")
+        db_rom.get_roms_by_fs_name.return_value = {}
+        db_rom.mark_missing_roms.return_value = [
+            Rom(fs_path="test/roms", fs_name="Collection"),
+            Rom(fs_path="test", fs_name="roms"),
+            Rom(fs_path="test/roms", fs_name="Bundle"),
+            Rom(fs_path="test/roms", fs_name="Saga"),
+            Rom(fs_path="test/roms", fs_name="Other"),
+        ]
+        db_firmware = mocker.patch.object(scan_module, "db_firmware_handler")
+        db_firmware.mark_missing_firmware.return_value = []
+
+        mocker.patch.object(scan_module, "_identify_rom", AsyncMock())
+        mock_log = mocker.patch.object(scan_module, "log")
+
+        await scan_module._identify_platform(
+            platform_slug="test",
+            scan_type=ScanType.QUICK,
+            fs_platforms=["test"],
+            roms_ids=[],
+            metadata_sources=[],
+            launchbox_remote_enabled=False,
+            socket_manager=AsyncMock(),
+            scan_stats=AsyncMock(),
+            scanned_rom_ids=set(),
+        )
+
+        stale = (
+            " (now scanned as a folder of roms, delete this stale entry to clean up)"
+        )
+        warnings = {str(call.args[0]) for call in mock_log.warning.call_args_list}
+        assert {
+            *(f" - {name}{stale}" for name in ("Collection", "roms", "Bundle")),
+            " - Saga",
+            " - Other",
+        } <= warnings, warnings
+
+
+class TestAncestorPaths:
+    def test_includes_each_path_and_its_parents(self):
+        fs_roms = [
+            make_fs_rom("a.zip", "test/roms/Saga Deluxe/Disc 1"),
+            make_fs_rom("b.zip", "test/roms/Bundle/"),
+        ]
+
+        assert _ancestor_paths(fs_roms) == {
+            "test",
+            "test/roms",
+            "test/roms/Saga Deluxe",
+            "test/roms/Saga Deluxe/Disc 1",
+            "test/roms/Bundle",
+            "test/roms/Bundle/",
+        }
+
+    def test_empty_input(self):
+        assert _ancestor_paths([]) == set()
+
+
 class TestIdentifyPlatformEmitsRestoredRoms:
     """A platform scan tells the client about ROMs that came back.
 
@@ -1437,7 +1582,7 @@ class TestIdentifyPlatformEmitsRestoredRoms:
         db_rom = mocker.patch.object(scan_module, "db_rom_handler")
         db_rom.get_roms_by_fs_name.return_value = {"test/roms/Game.zip": rom}
         db_rom.mark_missing_roms.return_value = []
-        db_rom.get_rom.return_value = rom
+        db_rom.get_roms_simple_by_ids.return_value = [rom]
 
         db_firmware = mocker.patch.object(scan_module, "db_firmware_handler")
         db_firmware.mark_missing_firmware.return_value = []
@@ -1445,7 +1590,9 @@ class TestIdentifyPlatformEmitsRestoredRoms:
         mocker.patch.object(
             SimpleRomSchema,
             "from_orm_with_factory",
-            return_value=Mock(model_dump=Mock(return_value={"id": rom.id})),
+            side_effect=lambda r, *a, **k: Mock(
+                model_dump=Mock(return_value={"id": r.id})
+            ),
         )
         mocker.patch.object(scan_module, "_identify_rom", AsyncMock())
 
@@ -1471,7 +1618,7 @@ class TestIdentifyPlatformEmitsRestoredRoms:
         await self._run(socket_manager)
 
         patched.bulk_mark_present.assert_called_once_with(1, [42])
-        patched.get_rom_simple.assert_called_once_with(42)
+        patched.get_roms_simple_by_ids.assert_called_once_with([42])
         assert any(
             call.args[0] == "scan:scanning_rom"
             for call in socket_manager.emit.call_args_list
@@ -1495,11 +1642,39 @@ class TestIdentifyPlatformEmitsRestoredRoms:
 
         await self._run(socket_manager)
 
-        patched.get_rom_simple.assert_not_called()
+        patched.get_roms_simple_by_ids.assert_not_called()
         assert not any(
             call.args[0] == "scan:scanning_rom"
             for call in socket_manager.emit.call_args_list
         )
+
+    async def test_restored_roms_hydrated_with_single_batched_call(
+        self, patched, mocker
+    ):
+        """Three restored ROMs issue one batched hydration read, in visit order."""
+        fs_roms = [make_fs_rom(f"Game{i}.zip") for i in range(3)]
+        mocker.patch.object(fs_rom_handler, "get_roms", AsyncMock(return_value=fs_roms))
+        roms = [
+            Rom(id=11 + i, fs_name=fs_rom["fs_name"], platform_id=1)
+            for i, fs_rom in enumerate(fs_roms)
+        ]
+        patched.get_roms_by_fs_name.return_value = {
+            f"test/roms/{rom.fs_name}": rom for rom in roms
+        }
+        patched.get_missing_rom_ids.return_value = {rom.id for rom in roms}
+        # Rows come back out of visit order, and the middle ROM drops out.
+        patched.get_roms_simple_by_ids.return_value = [roms[2], roms[0]]
+        socket_manager = AsyncMock()
+
+        await self._run(socket_manager)
+
+        patched.get_roms_simple_by_ids.assert_called_once_with([11, 12, 13])
+        emits = [
+            call
+            for call in socket_manager.emit.call_args_list
+            if call.args[0] == "scan:scanning_rom"
+        ]
+        assert [call.args[1]["id"] for call in emits] == [11, 13]
 
 
 class TestIdentifyPlatformFirmwareReporting:
@@ -1825,6 +2000,33 @@ class TestScanSelectedRoms:
         db_rom.mark_missing_roms.assert_not_called()
         db_rom.get_missing_rom_ids.assert_not_called()
         db_rom.bulk_mark_present.assert_not_called()
+
+    async def test_reads_only_the_selected_roms_gamelist_entries(
+        self, mocker, platform, rom
+    ):
+        mocker.patch.object(
+            scan_module, "redis_client", Mock(get=Mock(return_value=None))
+        )
+        mocker.patch.object(fs_rom_handler, "file_exists", AsyncMock(return_value=True))
+        mocker.patch.object(scan_module, "db_rom_handler")
+        mocker.patch.object(scan_module, "_identify_rom", side_effect=AsyncMock())
+        populate_cache = mocker.patch.object(
+            meta_gamelist_handler, "populate_cache", AsyncMock()
+        )
+
+        await _scan_selected_roms(
+            platform=platform,
+            roms=[rom],
+            scan_type=ScanType.COMPLETE,
+            roms_ids=[rom.id],
+            metadata_sources=[MetadataSource.GAMELIST],
+            launchbox_remote_enabled=False,
+            socket_manager=AsyncMock(),
+            scan_stats=AsyncMock(),
+            scanned_rom_ids=set(),
+        )
+
+        populate_cache.assert_awaited_once_with(platform, fs_names=["Game.zip"])
 
     async def test_a_rom_whose_file_is_gone_is_marked_missing_not_scanned(
         self, mocker, platform, rom
@@ -2226,6 +2428,25 @@ class TestScanConcurrency:
 
         assert enqueue.call_args.kwargs["started_by_user_id"] == authorized.id
 
+    @pytest.mark.parametrize(
+        ("options", "expected"),
+        [({}, ["igdb", "ss"]), ({"apis": []}, []), ({"apis": ["moby"]}, ["moby"])],
+        ids=["left-out", "none", "picked"],
+    )
+    async def test_a_scan_without_apis_uses_the_enabled_sources(
+        self, mocker, emit, options, expected
+    ):
+        patch_scan_jobs(mocker)
+        mocker.patch.object(
+            scan_module, "get_enabled_metadata_sources", return_value=["igdb", "ss"]
+        )
+        enqueue = mocker.patch.object(scan_queue, "enqueue")
+
+        await scan_handler("sid", {"type": "quick", **options})
+
+        assert enqueue.call_args is not None
+        assert enqueue.call_args.kwargs["metadata_sources"] == expected
+
     async def test_refuses_when_a_scan_is_running(self, mocker, emit):
         patch_scan_jobs(mocker, running=make_job(SCAN_PLATFORMS_FUNC))
         enqueue = mocker.patch.object(scan_queue, "enqueue")
@@ -2235,6 +2456,94 @@ class TestScanConcurrency:
         enqueue.assert_not_called()
         emit.assert_awaited_once()
         assert emit.await_args.args[0] == "scan:done_ko"
+
+    async def test_checks_again_once_another_request_has_queued_its_scan(
+        self, mocker, emit
+    ):
+        # Two requests on different web workers must not both pass the check.
+        queued: list[Job] = []
+        patch_scan_jobs(mocker)
+        mocker.patch.object(
+            scan_module,
+            "get_blocking_library_scans",
+            side_effect=lambda workers: (None, list(queued)),
+        )
+        enqueue = mocker.patch.object(scan_queue, "enqueue")
+
+        async with redis_lock(scan_module.LIBRARY_SCAN_REQUEST_LOCK, timeout_seconds=5):
+            request = asyncio.create_task(scan_handler("sid", {"type": "quick"}))
+            # Without the lock the request would have queued its scan by now.
+            await asyncio.sleep(0.2)
+            queued.append(make_job(SCAN_PLATFORMS_FUNC))
+        await request
+
+        enqueue.assert_not_called()
+        assert emit.await_args is not None
+        assert emit.await_args.args[0] == "scan:done_ko"
+
+    async def test_refuses_when_the_request_lock_stays_held(self, mocker, emit):
+        patch_held_scan_request_lock(mocker)
+        patch_scan_jobs(mocker)
+        enqueue = mocker.patch.object(scan_queue, "enqueue")
+
+        await scan_handler("sid", {"type": "quick"})
+
+        enqueue.assert_not_called()
+        assert emit.await_args is not None
+        assert emit.await_args.args[0] == "scan:done_ko"
+
+    async def test_a_timeout_past_the_lock_is_not_a_scan_in_flight(self, mocker):
+        patch_scan_jobs(mocker)
+        mocker.patch.object(scan_queue, "enqueue", side_effect=TimeoutError)
+
+        with pytest.raises(TimeoutError):
+            await scan_module.queue_scan(ScanPayload(apis=[]), started_by_user_id=1)
+
+        assert not await async_cache.exists(scan_module.LIBRARY_SCAN_REQUEST_LOCK)
+
+    async def test_releases_the_request_lock_once_queued(self, mocker, emit):
+        patch_scan_jobs(mocker)
+        mocker.patch.object(scan_queue, "enqueue")
+
+        await scan_handler("sid", {"type": "quick"})
+
+        assert not await async_cache.exists(scan_module.LIBRARY_SCAN_REQUEST_LOCK)
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"type": "deep"},
+            {"type": None},
+            {"platform": [1]},
+            {"apis": ["nope"]},
+            {"platforms": [None]},
+        ],
+        ids=["unknown-type", "no-type", "misspelt-key", "unknown-source", "null-id"],
+    )
+    async def test_refuses_options_the_payload_does_not_take(
+        self, mocker, emit, options
+    ):
+        patch_scan_jobs(mocker)
+        enqueue = mocker.patch.object(scan_queue, "enqueue")
+
+        await scan_handler("sid", options)
+
+        enqueue.assert_not_called()
+        assert emit.await_args is not None
+        assert emit.await_args.args[0] == "scan:done_ko"
+        assert emit.await_args.args[1].startswith("Invalid scan options: ")
+
+    async def test_refuses_when_no_scan_worker_listens(self, mocker, emit):
+        patch_scan_jobs(mocker)
+        mocker.patch.object(Worker, "all", return_value=[])
+        enqueue = mocker.patch.object(scan_queue, "enqueue")
+
+        await scan_handler("sid", {"type": "quick", "roms_ids": [7]})
+
+        enqueue.assert_not_called()
+        assert emit.await_args is not None
+        assert emit.await_args.args[0] == "scan:done_ko"
+        assert "worker" in emit.await_args.args[1]
 
     async def test_refuses_when_a_scan_is_queued(self, mocker, emit):
         patch_scan_jobs(mocker, scan_queued=[make_job(SCAN_PLATFORMS_FUNC)])

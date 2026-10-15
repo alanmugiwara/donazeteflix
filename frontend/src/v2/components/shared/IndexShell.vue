@@ -19,25 +19,32 @@
 //                     top bar.
 //   * `#listHeader`: list-mode column header (PlatformListHeader /
 //                     CollectionListHeader), sticky below the toolbar.
-//                     Only rendered when `listMode` is true.
-//   * default:       index content (grid / list / panels).
+//   * `#listRows`:   list-mode rows, in one table with the header.
+//                     Both list slots render only when `listMode` is true.
+//   * default:       index content (grid / panels / loading and empty states).
+import { useBreakpoint } from "@/v2/composables/useBreakpoint";
 import { usePinnedToolbar } from "@/v2/composables/usePinnedToolbar";
 
 interface Props {
-  /** Enables the sticky `#listHeader` band below the toolbar. */
+  /** Enables the list header and rows. */
   listMode?: boolean;
+  /** Names the list's table. */
+  listLabel?: string | undefined;
 }
 
-withDefaults(defineProps<Props>(), { listMode: false });
+withDefaults(defineProps<Props>(), { listMode: false, listLabel: undefined });
 
 defineSlots<{
   header(): unknown;
   toolbar(): unknown;
   listHeader(): unknown;
+  listRows(): unknown;
   default(): unknown;
 }>();
 
 const { toolbarHeight, pinned, bindToolbar, bindSentinel } = usePinnedToolbar();
+// Phones and tablets get a sort menu and plain link rows, so no table.
+const { smAndDown } = useBreakpoint();
 </script>
 
 <template>
@@ -61,10 +68,16 @@ const { toolbarHeight, pinned, bindToolbar, bindSentinel } = usePinnedToolbar();
 
     <div
       v-if="listMode"
-      class="r-v2-idx-shell__list-header"
-      :class="{ 'r-pinned-list-header': pinned }"
+      :role="smAndDown ? undefined : 'table'"
+      :aria-label="smAndDown ? undefined : listLabel"
     >
-      <slot name="listHeader" />
+      <div
+        class="r-v2-idx-shell__list-header"
+        :class="{ 'r-pinned-list-header': pinned }"
+      >
+        <slot name="listHeader" />
+      </div>
+      <slot name="listRows" />
     </div>
 
     <slot />
@@ -92,9 +105,7 @@ html[data-bp~="xs"] .r-v2-idx-shell {
 /* Tiles scrolled into view by keyboard or pad nav land clear of the fixed bars. */
 .r-v2-idx-shell :deep([data-focus-key]) {
   scroll-margin-top: calc(var(--r-nav-h) + var(--r-v2-idx-shell-toolbar-h));
-  scroll-margin-bottom: calc(
-    var(--r-bottom-nav-h) + env(safe-area-inset-bottom)
-  );
+  scroll-margin-bottom: calc(var(--r-bottom-nav-h) + var(--r-safe-b));
 }
 
 /* List mode: the column header and the rows run to the screen edges and keep
@@ -105,10 +116,9 @@ html[data-bp~="xs"] .r-v2-idx-shell {
 .r-v2-idx-shell__list-header {
   margin-inline: calc(-1 * var(--r-list-bleed, 0px));
 }
-/* The header already reaches both edges by the margin above, so the pinned
-   glass must not add the gutter a second time: the page has no horizontal
-   clip, and the surplus on the right would scroll the document sideways. */
+/* The margin above already spans the gutter, so the glass adds only the shell's
+   safe-area padding; more would scroll the unclipped page sideways. */
 .r-v2-idx-shell__list-header.r-pinned-list-header::before {
-  inset: 0;
+  inset: 0 calc(-1 * var(--r-safe-r)) 0 calc(-1 * var(--r-safe-l));
 }
 </style>

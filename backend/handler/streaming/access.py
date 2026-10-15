@@ -4,7 +4,12 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 
-from handler.auth.dependencies import get_permissions
+from handler.auth.dependencies import (
+    assert_can,
+    can_access,
+    get_permissions,
+    get_rom_visibility_filter,
+)
 from handler.database import db_platform_handler, db_rom_handler
 from handler.streaming.config import (
     ResolvedContainer,
@@ -19,6 +24,7 @@ from handler.streaming.session_store import (
     session_platform_matches,
 )
 from logger.logger import log
+from models.permission import PermAction, PermEntity
 from models.rom import Rom
 from models.user import Role
 
@@ -43,17 +49,40 @@ def assert_session_owner(session: dict[str, Any], request: Request) -> None:
     raise HTTPException(status_code=403, detail="Session is claimed by another user")
 
 
+def _allows_streaming(request: Request, *actions: PermAction) -> bool:
+    # A session is always the caller's own, so an "own items only" grant counts.
+    perms = get_permissions(request)
+    return all(perms.allows(PermEntity.STREAMING, a, owned=True) for a in actions)
+
+
+def can_see_streaming(request: Request) -> bool:
+    """Whether the caller may see streaming and play their own sessions."""
+    return _allows_streaming(request, PermAction.READ)
+
+
+def can_join_streaming(request: Request) -> bool:
+    """Whether the caller may join someone else's session."""
+    return can_access(get_permissions(request), PermEntity.STREAMING, PermAction.READ)
+
+
+def assert_can_join_streaming(request: Request) -> None:
+    """Raise 403 unless the caller may join someone else's session."""
+    assert_can(get_permissions(request), PermEntity.STREAMING, PermAction.READ)
+
+
+def assert_can_start_streaming(request: Request) -> None:
+    """Raise 403 unless the caller may start a session, which takes a container."""
+    if not _allows_streaming(request, PermAction.READ, PermAction.WRITE):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+
 def rom_is_visible(request: Request, rom: Rom | None) -> bool:
     """Can the caller see this ROM?
 
     Sessions outlive nothing but the cache, so a rom_id that no longer
     resolves is treated as visible: there is no hidden ROM left to protect.
     """
-    if rom is None:
-        return True
-    if not request.user.is_authenticated:
-        return True
-    return get_permissions(request).can_see_rom(rom.id, rom.platform_id)
+    return rom is None or get_rom_visibility_filter(request).allows(rom)
 
 
 def session_rom(session: dict[str, Any]) -> Rom | None:

@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import quote
 
 from sqlalchemy import BigInteger, ForeignKey, Index, String
-from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from models.base import (
     FILE_EXTENSION_MAX_LENGTH,
     FILE_NAME_MAX_LENGTH,
     FILE_PATH_MAX_LENGTH,
     BaseModel,
-    compute_file_name_parts,
+    FileNamePartsMixin,
+    compute_file_extension,
 )
 from utils.database import CustomJSON, ExactString
 
@@ -24,15 +25,29 @@ if TYPE_CHECKING:
 
 
 SAVE_SLOT_MAX_LENGTH = 255
+# Where a client with no slot of its own files new progress.
+AUTOSAVE_SLOT = "autosave"
 # A slot's versions, newest last: pruning locks exactly these rows through it.
 SAVE_SLOT_VERSIONS_INDEX = "ix_saves_rom_user_slot_updated"
 EMULATOR_MAX_LENGTH = 50
+MEMORY_CARD_NAME_MAX_LENGTH = 255
 ASSET_LABEL_MAX_LENGTH = 255
 ASSET_LABELS_MAX = 20
 CONTENT_HASH_MAX_LENGTH = 32
 
 
-class BaseAsset(BaseModel):
+class SaveLineage(NamedTuple):
+    """One emulator's saves in one format, whose versions in a slot are pruned together."""
+
+    emulator: str | None
+    file_extension: str
+
+    @classmethod
+    def of(cls, emulator: str | None, file_name: str) -> SaveLineage:
+        return cls(emulator, compute_file_extension(file_name).lower())
+
+
+class BaseAsset(FileNamePartsMixin, BaseModel):
     __abstract__ = True
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -46,19 +61,6 @@ class BaseAsset(BaseModel):
     file_size_bytes: Mapped[int] = mapped_column(BigInteger(), default=0)
 
     missing_from_fs: Mapped[bool] = mapped_column(default=False, nullable=False)
-
-    @validates("file_name")
-    def _sync_file_name_parts(self, _key: str, file_name: str) -> str:
-        """Derive the stored `file_name_no_tags` / `file_name_no_ext` /
-        `file_extension` columns whenever `file_name` is assigned.
-
-        Defined on the abstract base so every asset subclass inherits it.
-        """
-        parts = compute_file_name_parts(file_name)
-        self.file_name_no_tags = parts.no_tags
-        self.file_name_no_ext = parts.no_ext
-        self.file_extension = parts.extension
-        return file_name
 
     @cached_property
     def full_path(self) -> str:
@@ -141,6 +143,10 @@ class Save(RomAsset):
         lazy="raise",
     )
 
+    @property
+    def lineage(self) -> SaveLineage:
+        return SaveLineage.of(self.emulator, self.file_name)
+
     @cached_property
     def screenshot(self) -> Screenshot | None:
         from handler.database import db_screenshot_handler
@@ -183,9 +189,18 @@ class State(RomAsset):
     core: Mapped[str | None] = mapped_column(
         String(length=EMULATOR_MAX_LENGTH), nullable=True, default=None
     )
+    # NULL on states stored before they were hashed.
+    content_hash: Mapped[str | None] = mapped_column(
+        String(length=CONTENT_HASH_MAX_LENGTH), nullable=True, default=None
+    )
 
     rom: Mapped[Rom] = relationship(lazy="joined", back_populates="states")
     user: Mapped[User] = relationship(lazy="joined", back_populates="states")
+
+    @property
+    def is_stream_capture(self) -> bool:
+        """Whether a streaming session captured this state: only a stream records its core."""
+        return self.core is not None
 
     @cached_property
     def screenshot(self) -> Screenshot | None:
@@ -226,7 +241,7 @@ class MemoryCard(BaseModel):
         ForeignKey("platforms.id", ondelete="SET NULL"),
         default=None,
     )
-    name: Mapped[str] = mapped_column(String(length=255))
+    name: Mapped[str] = mapped_column(String(length=MEMORY_CARD_NAME_MAX_LENGTH))
     # Only slot 1 is used today; kept so a future multi-slot layout needs no
     # schema change.
     slot: Mapped[int] = mapped_column(default=1)

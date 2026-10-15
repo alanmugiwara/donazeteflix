@@ -1,5 +1,5 @@
 [![Docker Image](https://img.shields.io/badge/Docker%20HUB-alanmugiwara%2Fdonazeteflix-2496ED?color=8A2BE2&style=for-the-badge&logo=docker&logoColor=white)](https://hub.docker.com/r/alanmugiwara/donazeteflix)
-[![Based on RomM](https://img.shields.io/badge/Based%20on-RomM%205.3.1-8A2BE2?style=for-the-badge)](https://github.com/rommapp/romm)
+[![Based on RomM](https://img.shields.io/badge/Based%20on-RomM%205.4.0-8A2BE2?style=for-the-badge)](https://github.com/rommapp/romm)
 [![License](https://img.shields.io/badge/License-GPL--3.0-8A2BE2?style=for-the-badge)](https://github.com/alanmugiwara/donazeteflix?tab=AGPL-3.0-1-ov-file)
 [![Create Date](https://img.shields.io/badge/created%20on-set%2028,%202026-8A2BE2?style=for-the-badge)](https://github.com/alanmugiwara/donazeteflix)
 [![Last update](https://img.shields.io/github/last-commit/alanmugiwara/donazeteflix?color=8A2BE2&label=Last%20Commit&style=for-the-badge)](https://github.com/alanmugiwara/donazeteflix)
@@ -140,55 +140,61 @@ A imagem está publicada no Docker Hub:
 - LaunchBox
 - HowLongToBeat (HLTB)
 
----
+---alanmugiwara/donazeteflix:0.1
+SEU-USUARIO/NOME-DO-SEU-PROJETO:VERSAO-DO-PROJETO \
 
 ## Building e criação da sua própria imagem
 
 - Baixe este repositório e entre no diretório do projeto
 ``` bash
-git clone https://github.com/alanmugiwara/donazeteflix \
-&& cd donazeteflix
+git clone https://github.com/alanmugiwara/donazeteflix
+cd donazeteflix
 ```
-- Faça o build da imagem e rode localmente
+- Fazer o build e disponibilizar para o seu Docker Hub (Multi-arquitetura)
 ``` bash
 docker buildx build \
 --no-cache \
 --platform linux/amd64,linux/arm64 \
 --target full-image \
---tag alanmugiwara/donazeteflix:0.1 \
+--tag SEU-USUARIO/NOME-DO-PROJETO:VERSAO-DA-APLICAÇÃO \
 --file docker/Dockerfile \
---load \
+--pull \
  .
  ```
-- Suba os containers
-``` bash
- docker compose up -d
-  ```
-### Se você quer apenas buildar localmente para testar com docker compose, faça para a arquitetura da sua máquina, pois o `--load` não funciona com `--platform linux/amd64,linux/arm64` para carregar um manifest multiarch no Docker local.
 
- - Se preferir fazer o build e subir para o seu Docker Hub (AMD64)
+### Para apenas buildar localmente e testar com Docker Compose, faça para a arquitetura da sua máquina, pois o `--load` não funciona com `--platform linux/amd64,linux/arm64` para carregar um manifest multiarch no Docker local.
+
+ - Build para arquitetura (AMD64)
 ``` bash
 docker buildx build \
 --no-cache \
 --platform linux/amd64 \
 --target full-image \
---tag SEU-USUARIO/NOME-DO-SEU-PROJETO:VERSAO-DO-PROJETO \
+--tag SEU-USUARIO/NOME-DO-PROJETO:VERSAO-DA-APLICAÇÃO \
 --file docker/Dockerfile \
---push \
+--load \
  .
  ```
+ - Suba os containers
+``` bash
+ docker compose up -d
+  ```
 
-  - Se preferir fazer o build e subir para o seu Docker Hub (ARM64)
+  - Build para arquitetura (ARM64) 
 ``` bash
 docker buildx build \
 --no-cache \
 --platform linux/arm64 \
 --target full-image \
---tag SEU-USUARIO/NOME-DO-SEU-PROJETO:VERSAO-DO-PROJETO \
+--tag SEU-USUARIO/NOME-DO-PROJETO:VERSAO-DA-APLICAÇÃO \
 --file docker/Dockerfile \
---push \
+--load \
  .
  ```
+ - Suba os containers
+``` bash
+ docker compose up -d
+  ```
 
 ## Contato
 

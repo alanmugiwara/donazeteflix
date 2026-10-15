@@ -39,10 +39,10 @@ import { useCan } from "@/v2/composables/useCan";
 import { useConfirm } from "@/v2/composables/useConfirm";
 import { useIsAlive } from "@/v2/composables/useIsAlive";
 import { usePageTitle } from "@/v2/composables/usePageTitle";
+import { useRouteQueryParam } from "@/v2/composables/useRouteQueryParam";
 import { useSnackbar } from "@/v2/composables/useSnackbar";
 import storeGalleryRoms from "@/v2/stores/galleryRoms";
 import type { StatRow } from "@/v2/types/stats";
-import { syncQueryParam } from "@/v2/utils/routeQuery";
 
 const { t } = useI18n();
 const route = useRoute();
@@ -72,21 +72,13 @@ const canScan = useCan("library.scan");
 const canDownload = useCan("rom.download");
 
 // ── Tabs ─────────────────────────────────────────────────────────
-// URL-persistent via `?tab=` (mirrors the GameDetails pattern). The
-// default tab is `library`.
 type TabId = "library" | "firmware" | "settings" | "memory-cards";
-const VALID_TABS = new Set<TabId>([
+const TAB_IDS: readonly TabId[] = [
   "library",
   "firmware",
   "settings",
   "memory-cards",
-]);
-
-function parseTab(v: unknown): TabId {
-  return typeof v === "string" && VALID_TABS.has(v as TabId)
-    ? (v as TabId)
-    : "library";
-}
+];
 
 // The memory-card tab only exists for platforms whose streaming container
 // syncs whole cards (PCSX2 today). `emulator` is the hard key the manager
@@ -96,15 +88,7 @@ const memoryCardEmulator = computed<string | null>(() => {
   return c?.supports_memory_cards ? c.emulator : null;
 });
 
-const tab = ref<TabId>(parseTab(route.query.tab));
-watch(tab, (value) => syncQueryParam(router, "tab", value));
-watch(
-  () => route.query.tab,
-  (value) => {
-    const next = parseTab(value);
-    if (next !== tab.value) tab.value = next;
-  },
-);
+const tab = useRouteQueryParam("tab", "library", TAB_IDS);
 
 const tabs = computed<RTabNavItem[]>(() => [
   { id: "library", label: t("common.library") },
@@ -331,7 +315,7 @@ async function loadForId(platformId: number) {
 }
 
 onMounted(() => {
-  loadForId(Number(route.params.platform));
+  void loadForId(Number(route.params.platform));
 });
 
 onBeforeRouteUpdate((to, from) => {
@@ -340,13 +324,13 @@ onBeforeRouteUpdate((to, from) => {
   // the new platform's load. A query-only change (sort, filters,
   // search) stays on this platform and must not reload it.
   if (to.path === from.path) return;
-  if (to.name === "platform") loadForId(Number(to.params.platform));
+  if (to.name === "platform") void loadForId(Number(to.params.platform));
 });
 
 watch(
   () => route.params.platform,
   (next) => {
-    if (next != null) loadForId(Number(next));
+    if (next != null) void loadForId(Number(next));
   },
 );
 
@@ -354,7 +338,7 @@ watch(
 function onUploadRoms() {
   const p = currentPlatform.value;
   if (!p) return;
-  router.push({ name: ROUTES.UPLOAD, query: { platform: String(p.id) } });
+  void router.push({ name: ROUTES.UPLOAD, query: { platform: String(p.id) } });
 }
 
 function onScan() {
@@ -391,7 +375,7 @@ async function onRandomGame() {
       snackbar.info(t("platform.random-rom-empty"));
       return;
     }
-    router.push({ name: ROUTES.ROM, params: { rom: data.id } });
+    void router.push({ name: ROUTES.ROM, params: { rom: data.id } });
   } catch {
     if (!stale()) snackbar.error(t("platform.random-rom-error"));
   } finally {
@@ -432,7 +416,7 @@ async function onDelete() {
     snackbar.success(t("platform.platform-deleted", { name: p.display_name }), {
       icon: "mdi-check-bold",
     });
-    router.push({ name: ROUTES.PLATFORMS_INDEX });
+    void router.push({ name: ROUTES.PLATFORMS_INDEX });
   } catch (err) {
     const e = err as {
       response?: { data?: { msg?: string } };

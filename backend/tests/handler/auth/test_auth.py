@@ -1,3 +1,4 @@
+import threading
 from base64 import b64encode
 from datetime import timedelta
 from typing import Any
@@ -7,17 +8,16 @@ from fastapi import status
 from fastapi.exceptions import HTTPException
 from starlette.datastructures import Headers
 from starlette.requests import HTTPConnection
+from tests.factories import make_device_token
 
 from config import OAUTH_REFRESH_TOKEN_EXPIRE_SECONDS
-from handler.auth import auth_handler, oauth_handler
+from handler.auth.base_handler import auth_handler, oauth_handler
 from handler.auth.constants import EDIT_SCOPES
 from handler.auth.hybrid_auth import HybridAuthBackend
 from handler.database import (
-    db_client_token_handler,
     db_device_handler,
     db_user_handler,
 )
-from models.client_token import ClientToken
 from models.device import Device
 from models.user import User
 
@@ -34,6 +34,33 @@ def test_verify_password():
     assert not auth_handler.verify_password(
         "password", "3f2b1c7e-0c1d-4f5a-9a2b-8e7d6c5b4a39"
     )
+    assert not auth_handler.verify_password("password", None)
+
+
+def test_verify_password_long_secret():
+    long_password = "x" * 100
+    assert auth_handler.verify_password(
+        long_password, auth_handler.get_password_hash(long_password)
+    )
+
+
+@pytest.mark.parametrize(
+    "password, legacy_hash",
+    [
+        (
+            "password",
+            "$2b$12$LMZZK1kiutIELMOo4/fpOeljO2j6NrutGrLk72/mJQfhueGMPCi/O",
+        ),
+        (
+            "x" * 100,
+            "$2b$12$6PshUF896mGxuAeJyKdlVewsFCgOlduOYYHWQo.VtTvXtuw.4tbou",
+        ),
+    ],
+)
+def test_verify_password_passlib_hash(password: str, legacy_hash: str):
+    """Hashes stored by passlib 1.7 with bcrypt 4 keep verifying."""
+    assert auth_handler.verify_password(password, legacy_hash)
+    assert not auth_handler.verify_password("wrong", legacy_hash)
 
 
 def test_authenticate_user(admin_user: User):
@@ -201,6 +228,39 @@ async def test_hybrid_auth_backend_basic_auth_header(editor_user: User):
     assert set(creds.scopes).issubset(editor_user.oauth_scopes)
 
 
+async def test_hybrid_auth_backend_basic_auth_runs_db_and_bcrypt_off_event_loop(
+    editor_user: User, monkeypatch: pytest.MonkeyPatch
+):
+    token = b64encode(b"test_editor:test_editor_password").decode()
+    loop_thread = threading.get_ident()
+    check_threads: list[int] = []
+    active_threads: list[int] = []
+    verify_password = auth_handler.verify_password
+    set_last_active = User.set_last_active
+
+    def recording_verify_password(*args: Any) -> bool:
+        check_threads.append(threading.get_ident())
+        return verify_password(*args)
+
+    def recording_set_last_active(self: User) -> None:
+        active_threads.append(threading.get_ident())
+        set_last_active(self)
+
+    monkeypatch.setattr(auth_handler, "verify_password", recording_verify_password)
+    monkeypatch.setattr(User, "set_last_active", recording_set_last_active)
+
+    class MockConnection(HTTPConnection):
+        def __init__(self) -> None:
+            self.scope: dict[str, dict[str, Any]] = {"session": {}}
+            self._headers = Headers({"Authorization": f"Basic {token}"})
+
+    result = await HybridAuthBackend().authenticate(MockConnection())
+
+    assert result is not None
+    assert check_threads and loop_thread not in check_threads
+    assert active_threads and loop_thread not in active_threads
+
+
 async def test_hybrid_auth_backend_basic_auth_header_unencoded(editor_user: User):
     class MockConnection(HTTPConnection):
         def __init__(self):
@@ -295,16 +355,8 @@ async def test_hybrid_auth_backend_scope_subset(editor_user: User):
 
 
 def _issue_client_token(user: User, device_id: str | None = None) -> str:
-    raw_token = auth_handler.generate_client_token()
-    hashed = auth_handler.hash_client_token(raw_token)
-    db_client_token_handler.add_token(
-        ClientToken(
-            user_id=user.id,
-            name="test-token",
-            hashed_token=hashed,
-            scopes=" ".join(user.oauth_scopes[:3]),
-            device_id=device_id,
-        )
+    _, raw_token = make_device_token(
+        user, device_id, scopes=" ".join(user.oauth_scopes[:3])
     )
     return raw_token
 

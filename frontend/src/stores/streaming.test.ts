@@ -1,10 +1,10 @@
-import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import streamingApi, { type JoinableSession } from "@/services/api/streaming";
 import { useStreamingStore } from "@/stores/streaming";
 
 vi.mock("@/services/api/streaming", () => ({
   default: {
+    fetchConfig: vi.fn(),
     listJoinableSessions: vi.fn(),
     saveAndExit: vi.fn(),
     saveAndExitKeepalive: vi.fn(),
@@ -12,8 +12,6 @@ vi.mock("@/services/api/streaming", () => ({
 }));
 
 describe("platformCapabilities disc flags", () => {
-  beforeEach(() => setActivePinia(createPinia()));
-
   it("maps the backend disc flags to camelCase", () => {
     const store = useStreamingStore();
     store.config = {
@@ -51,8 +49,6 @@ describe("platformCapabilities disc flags", () => {
 });
 
 describe("emulator labels", () => {
-  beforeEach(() => setActivePinia(createPinia()));
-
   it("names an emulator by the label the backend ships", () => {
     const store = useStreamingStore();
     store.config = {
@@ -108,7 +104,6 @@ describe("joinable sessions", () => {
   }
 
   beforeEach(() => {
-    setActivePinia(createPinia());
     listJoinableSessions.mockReset();
     listJoinableSessions.mockResolvedValue(sessions(7));
   });
@@ -148,6 +143,15 @@ describe("joinable sessions", () => {
     expect(store.joinableForRom(7)).toBeNull();
   });
 
+  it("asks for nothing once the config says streaming is off", async () => {
+    const store = useStreamingStore();
+    store.configLoaded = true;
+
+    await store.fetchJoinableSessions(true);
+
+    expect(listJoinableSessions).not.toHaveBeenCalled();
+  });
+
   it("keeps the last known list when a refresh fails", async () => {
     const store = useStreamingStore();
     await store.fetchJoinableSessions();
@@ -165,7 +169,6 @@ describe("save-and-exit", () => {
     streamingApi.saveAndExitKeepalive as unknown as Mock;
 
   beforeEach(() => {
-    setActivePinia(createPinia());
     saveAndExit.mockReset();
     saveAndExitKeepalive.mockReset();
   });
@@ -206,5 +209,71 @@ describe("save-and-exit", () => {
       "ps2-1",
       "2026-01-01T00:00:00Z",
     );
+  });
+});
+
+describe("config", () => {
+  const fetchConfig = streamingApi.fetchConfig as unknown as Mock;
+
+  beforeEach(() => {
+    fetchConfig.mockReset();
+    fetchConfig.mockResolvedValue({
+      data: { enabled: true, containers: [], emulator_labels: {} },
+    });
+  });
+
+  it("collapses concurrent callers into one request", async () => {
+    // App load and the Stream page both ask; two requests could land out of
+    // order and leave the older answer in place.
+    const store = useStreamingStore();
+
+    await Promise.all([store.fetchConfig(), store.fetchConfig()]);
+
+    expect(fetchConfig).toHaveBeenCalledTimes(1);
+    expect(store.config.enabled).toBe(true);
+  });
+
+  it("asks again once the earlier request has settled", async () => {
+    const store = useStreamingStore();
+
+    await store.fetchConfig();
+    await store.fetchConfig();
+
+    expect(fetchConfig).toHaveBeenCalledTimes(2);
+  });
+
+  it("asks again after a failed request", async () => {
+    const store = useStreamingStore();
+    fetchConfig.mockRejectedValueOnce(new Error("offline"));
+
+    await store.fetchConfig();
+    await store.fetchConfig();
+
+    expect(fetchConfig).toHaveBeenCalledTimes(2);
+    expect(store.config.enabled).toBe(true);
+  });
+
+  it("drops a reply asked for before a logout", async () => {
+    // The old account's platforms must not land in the next account's config.
+    const store = useStreamingStore();
+    let answer!: (value: unknown) => void;
+    fetchConfig.mockImplementationOnce(
+      () => new Promise((resolve) => (answer = resolve)),
+    );
+    const stale = store.fetchConfig();
+
+    store.reset();
+    const fresh = store.fetchConfig();
+    answer({
+      data: {
+        enabled: true,
+        containers: [{ platform: "n64" }],
+        emulator_labels: {},
+      },
+    });
+    await Promise.all([stale, fresh]);
+
+    expect(fetchConfig).toHaveBeenCalledTimes(2);
+    expect(store.config.containers).toEqual([]);
   });
 });

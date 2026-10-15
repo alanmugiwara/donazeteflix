@@ -4,8 +4,8 @@
 //
 // Two sources feed the list:
 //   1. Scraped resources: ScreenScraper is the richest and wins; gamelist
-//      fills in for the few types it also scrapes (mirrors v1's MediaCarousel
-//      fallbacks).
+//      and LaunchBox fill in for the few types they also scrape (mirrors
+//      v1's MediaCarousel fallbacks).
 //   2. Library media files: images/videos sitting at the top level of the
 //      game folder on disk (rom.files), so a trailer or artwork dropped next
 //      to the ROM shows up here too.
@@ -17,10 +17,9 @@
 // other provider's cover can outrank, so it needs a home of its own.
 import i18n from "@/locales";
 import type { DetailedRom } from "@/stores/roms";
-import { FRONTEND_RESOURCES_PATH } from "@/utils";
 import type { MediaShelfItem } from "@/v2/components/GameDetails/MediaShelf.vue";
 import { mediaKey } from "@/v2/utils/mediaKeys";
-import { versionedRomFileUrl } from "@/v2/utils/romFiles";
+import { versionedResourceUrl, versionedRomFileUrl } from "@/v2/utils/romFiles";
 
 // Library file extensions the browser can render inline. Kept in sync with the
 // backend download endpoint (utils/media_types.py), which serves these inline.
@@ -51,7 +50,7 @@ type ArtworkDef = Omit<MediaShelfItem, "url"> & {
 export function resolveRomArtwork(rom: DetailedRom): MediaShelfItem[] {
   const ss = rom.ss_metadata;
   const gl = rom.gamelist_metadata;
-  const cacheBust = encodeURIComponent(rom.updated_at);
+  const lb = rom.launchbox_metadata;
   const seen = new Set<string>();
   const out: MediaShelfItem[] = [];
   const extraDiscs = (ss?.physical_extra_discs ?? []).filter((d) => d.path);
@@ -93,22 +92,22 @@ export function resolveRomArtwork(rom: DetailedRom): MediaShelfItem[] {
     {
       key: "box3d",
       label: i18n.global.t("rom.media-box3d"),
-      url: ss?.box3d_path ?? gl?.box3d_path ?? null,
+      url: ss?.box3d_path ?? gl?.box3d_path ?? lb?.box3d_path ?? null,
     },
     {
       key: "box2d",
       label: i18n.global.t("rom.media-box2d"),
-      url: ss?.box2d_path ?? null,
+      url: ss?.box2d_path ?? lb?.box2d_path ?? null,
     },
     {
       key: "box2d_back",
       label: i18n.global.t("rom.media-box2d-back"),
-      url: ss?.box2d_back_path ?? null,
+      url: ss?.box2d_back_path ?? lb?.box2d_back_path ?? null,
     },
     {
       key: "box2d_side",
       label: i18n.global.t("rom.media-box2d-side"),
-      url: ss?.box2d_side_path ?? null,
+      url: ss?.box2d_side_path ?? lb?.box2d_side_path ?? null,
     },
     {
       key: "physical",
@@ -181,7 +180,7 @@ export function resolveRomArtwork(rom: DetailedRom): MediaShelfItem[] {
       label: def.label,
       url: def.isAbsolute
         ? def.url
-        : `${FRONTEND_RESOURCES_PATH}/${def.url}?v=${cacheBust}`,
+        : versionedResourceUrl(def.url, rom.updated_at),
       isVideo: def.isVideo ?? false,
     });
   }

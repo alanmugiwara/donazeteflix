@@ -18,11 +18,13 @@ import {
   downloadButtons,
   selectableItems,
 } from "@/v2/utils/saveStates.plays";
+import { CONTRAST_TODO_PARAMETERS } from "@/v2/utils/storyA11y";
 import AssetList from "./AssetList.vue";
 
 const meta: Meta<typeof AssetList> = {
   title: "Shared/AssetList",
   component: AssetList,
+  parameters: CONTRAST_TODO_PARAMETERS,
   decorators: [
     () => ({
       template: `
@@ -77,36 +79,36 @@ export const SlotLibrary: Story = {
   name: "Saves · slots (selectable)",
   render: () => {
     const saves = saveSlotLibrary();
-    return selectableList(saves, "save", saves[0].id);
+    return selectableList(saves, "save", saves[0]!.id);
   },
   play: async ({ canvasElement, step }) => {
     const ui = within(canvasElement);
     await step("named slot groups are visible", async () => {
-      expect(ui.getByText("autosave")).toBeTruthy();
-      expect(ui.getByText("main_quest")).toBeTruthy();
+      await expect(ui.getByText("autosave")).toBeTruthy();
+      await expect(ui.getByText("main_quest")).toBeTruthy();
     });
     await step("clicking a row updates selection", async () => {
       const target = selectableItems(canvasElement).find(
         (r) => r.getAttribute("aria-pressed") === "false",
       );
-      expect(target).toBeTruthy();
+      await expect(target).toBeTruthy();
       await userEvent.click(target!);
-      expect(target).toHaveAttribute("aria-pressed", "true");
+      await expect(target).toHaveAttribute("aria-pressed", "true");
     });
   },
 };
 
-// Selecting an older version unfolds its slot so the pick stays visible.
+/** Selecting an older version unfolds its slot so the pick stays visible. */
 export const OlderVersionSelected: Story = {
   name: "Saves · older version selected",
   render: () => {
     const saves = saveSlotLibrary();
-    const olderMainQuest = saves.filter((s) => s.slot === "main_quest")[3];
+    const olderMainQuest = saves.filter((s) => s.slot === "main_quest")[3]!;
     return selectableList(saves, "save", olderMainQuest.id);
   },
 };
 
-// Only manual uploads, no screenshots: the pre-slot shape of a library.
+/** Only manual uploads, no screenshots: the pre-slot shape of a library. */
 export const ArchiveOnly: Story = {
   name: "Saves · archive only",
   render: () => {
@@ -122,7 +124,7 @@ export const ArchiveOnly: Story = {
   },
 };
 
-// Flat list ordered by upload time, as the player's stream picker shows it.
+/** Flat list ordered by upload time, as the player's stream picker shows it. */
 export const StreamArchives: Story = {
   name: "Saves · stream (created, flat)",
   render: () => {
@@ -131,19 +133,19 @@ export const StreamArchives: Story = {
       makeSave(2, null, 20),
       makeSave(3, null, 30, { screenshot: saveScreenshot(200) }),
     ];
-    return selectableList(saves, "save", saves[0].id, {
+    return selectableList(saves, "save", saves[0]!.id, {
       timestamp: "created",
       groupBySlot: false,
     });
   },
 };
 
-// One slot, one version, the most common case for new players.
+/** One slot, one version, the most common case for new players. */
 export const SingleSave: Story = {
   name: "Saves · single",
   render: () => {
     const saves = makeSaveSlot("autosave", 1, 2, 1);
-    return selectableList(saves, "save", saves[0].id);
+    return selectableList(saves, "save", saves[0]!.id);
   },
 };
 
@@ -151,7 +153,7 @@ export const StatesSelectable: Story = {
   name: "States · selectable",
   render: () => {
     const states = manyStates(5);
-    return selectableList(states, "state", states[0].id);
+    return selectableList(states, "state", states[0]!.id);
   },
 };
 
@@ -159,20 +161,20 @@ export const IdenticalPrefixStates: Story = {
   name: "States · identical prefix",
   render: () => {
     const states = identicalPrefixStates(4);
-    return selectableList(states, "state", states[0].id);
+    return selectableList(states, "state", states[0]!.id);
   },
   play: async ({ canvasElement, step }) => {
     await step("each row keeps the full filename in the DOM", async () => {
       const rows = selectableItems(canvasElement);
-      expect(rows).toHaveLength(4);
+      await expect(rows).toHaveLength(4);
       for (const el of rows) {
-        expect(el.textContent).toContain(IDENTICAL_STATE_PREFIX);
+        await expect(el.textContent).toContain(IDENTICAL_STATE_PREFIX);
       }
     });
   },
 };
 
-// Management mode: static rows hosting the actions slot.
+/** Management mode: static rows hosting the actions slot. */
 export const ManageSaves: Story = {
   name: "Saves · manage + actions",
   render: () => ({
@@ -194,17 +196,17 @@ export const ManageSaves: Story = {
       async () => {
         const ui = within(canvasElement);
         const rows = ui.getAllByRole("listitem");
-        expect(
+        await expect(
           rows.some((r) => r.textContent?.includes("chrono_trigger")),
         ).toBe(true);
-        expect(
+        await expect(
           ui.queryAllByRole("button", { name: /^chrono_trigger/ }),
         ).toEqual([]);
       },
     );
     await step("own-item actions include download and delete", async () => {
-      expect(downloadButtons(canvasElement).length).toBeGreaterThan(0);
-      expect(deleteButtons(canvasElement).length).toBeGreaterThan(0);
+      await expect(downloadButtons(canvasElement).length).toBeGreaterThan(0);
+      await expect(deleteButtons(canvasElement).length).toBeGreaterThan(0);
     });
   },
 };
@@ -226,18 +228,18 @@ export const ManageStates: Story = {
   }),
 };
 
-// Other users' public saves show an owner chip and only a download action.
+/** Other users' public saves show an owner chip and only a download action. */
 export const CommunitySaves: Story = {
   name: "Saves · community (show owner)",
   play: async ({ canvasElement, step }) => {
     const ui = within(canvasElement);
     await step("community author chips render", async () => {
-      expect(ui.getByText("speedrunner42")).toBeTruthy();
-      expect(ui.getByText("archivist")).toBeTruthy();
+      await expect(ui.getByText("speedrunner42")).toBeTruthy();
+      await expect(ui.getByText("archivist")).toBeTruthy();
     });
     await step("community rows offer download only", async () => {
-      expect(downloadButtons(canvasElement).length).toBe(2);
-      expect(ui.queryByRole("button", { name: /^Delete /i })).toBeNull();
+      await expect(downloadButtons(canvasElement).length).toBe(2);
+      await expect(ui.queryByRole("button", { name: /^Delete /i })).toBeNull();
     });
   },
   render: () => ({
@@ -269,7 +271,7 @@ export const CommunitySaves: Story = {
   }),
 };
 
-// Empty, distinct from "no save selected".
+/** Empty, distinct from "no save selected". */
 export const EmptySaves: Story = {
   name: "Empty · saves",
   render: () => ({
@@ -280,7 +282,7 @@ export const EmptySaves: Story = {
   }),
   play: async ({ canvasElement, step }) => {
     await step("empty saves message", async () => {
-      expect(
+      await expect(
         within(canvasElement).getByText("No saves available"),
       ).toBeTruthy();
     });
@@ -297,7 +299,7 @@ export const EmptyStates: Story = {
   }),
   play: async ({ canvasElement, step }) => {
     await step("empty states message", async () => {
-      expect(
+      await expect(
         within(canvasElement).getByText("No states available"),
       ).toBeTruthy();
     });

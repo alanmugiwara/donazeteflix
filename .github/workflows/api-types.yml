@@ -8,6 +8,7 @@ on:
       - frontend/package.json
       - frontend/package-lock.json
       - ".github/workflows/api-types.yml"
+      - ".github/actions/setup-frontend/**"
       - pyproject.toml
       - uv.lock
       - .python-version
@@ -20,6 +21,7 @@ on:
       - frontend/package.json
       - frontend/package-lock.json
       - ".github/workflows/api-types.yml"
+      - ".github/actions/setup-frontend/**"
       - pyproject.toml
       - uv.lock
       - .python-version
@@ -34,7 +36,7 @@ permissions:
 
 jobs:
   api-types:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout repository

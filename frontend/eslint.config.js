@@ -1,16 +1,60 @@
 import eslint from "@eslint/js";
+import { vueTsConfigs, withVueTs } from "@vue/eslint-config-typescript";
 import prettierConfig from "eslint-config-prettier/flat";
 import { createTypeScriptImportResolver } from "eslint-import-resolver-typescript";
 import importX from "eslint-plugin-import-x";
 import vue from "eslint-plugin-vue";
 import vuea11y from "eslint-plugin-vuejs-accessibility";
 import globals from "globals";
-import tseslint from "typescript-eslint";
 import romm from "./eslint-plugin-romm/index.js";
+import e2eConfig from "./eslint.e2e.config.js";
 
-export default tseslint.config(
+// Heavy modules that belong in a lazy chunk; add the next one here.
+const heavyImports = [
+  {
+    group: ["md-editor-v3", "md-editor-v3/**"],
+    allowTypeImports: true,
+    message:
+      "md-editor-v3 is heavy; render it through @/v2/components/shared/asyncMarkdown.",
+  },
+  {
+    group: [
+      "**/markdownPreview",
+      "**/markdownEditor",
+      "**/MarkdownViewer.vue",
+      "**/mdeditor",
+    ],
+    allowTypeImports: true,
+    message:
+      "This module bundles md-editor-v3; import it only from a lazy chunk.",
+  },
+];
+
+const romCastRule = {
+  selector:
+    "TSAsExpression:matches([typeAnnotation.typeName.name=/^(SimpleRom|DetailedRom|SimpleRomSchema|DetailedRomSchema|RomFileSchema|RomUserSchema|RomMetadataSchema)$/], [typeAnnotation.elementType.typeName.name=/^(SimpleRom|DetailedRom|SimpleRomSchema|DetailedRomSchema|RomFileSchema)$/], [typeAnnotation.objectType.typeName.name=/^(SimpleRom|DetailedRom|SimpleRomSchema|DetailedRomSchema)$/])",
+  message:
+    "Build ROM fixtures with romFixture or detailedRomFixture from @/utils/rom.fixtures instead of a cast.",
+};
+
+const platformCastRule = {
+  selector:
+    "TSAsExpression[typeAnnotation.typeName.name=/^(Platform|PlatformSchema)$/]",
+  message:
+    "Build platform fixtures with platformFixture from @/utils/platform.fixtures instead of a cast.",
+};
+
+// Only object literals: reading a value back as one of these types is fine.
+const modelCastRule = {
+  selector:
+    ":matches(TSAsExpression[expression.type='ObjectExpression'], TSAsExpression[expression.expression.type='ObjectExpression'])[typeAnnotation.typeName.name=/^(User|UserSchema|Collection|CollectionSchema|SaveSchema|StateSchema|AuditEventSchema)$/]",
+  message:
+    "Build users, collections, saves, states and audit events with their fixtures (userFixture, collectionFixture, saveFixture, stateFixture, makeAuditEvent) instead of casting an object literal.",
+};
+
+export default withVueTs(
   eslint.configs.recommended,
-  ...tseslint.configs.recommended,
+  vueTsConfigs.recommendedTypeChecked,
   ...vue.configs["flat/recommended"],
   ...vuea11y.configs["flat/recommended"],
   importX.flatConfigs.recommended,
@@ -39,6 +83,7 @@ export default tseslint.config(
       "dev-dist/**",
       "storybook-static/**",
       "coverage/**",
+      "e2e/.output/**",
     ],
   },
   {
@@ -57,11 +102,6 @@ export default tseslint.config(
       "src/plugins/*.d.ts",
     ],
     languageOptions: {
-      parserOptions: {
-        parser: "@typescript-eslint/parser",
-        ecmaVersion: 2022,
-        extraFileExtensions: [".vue"],
-      },
       globals: {
         ...globals.browser,
       },
@@ -89,6 +129,13 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    files: [
+      "src/v2/utils/gmeAudioWorklet.js",
+      "src/v2/utils/pico8AudioWorklet.js",
+    ],
+    languageOptions: { globals: globals.audioWorklet },
+  },
   // Import cycles. The resolver has to be the one that reads tsconfig `paths`,
   // or `@/*` and `@v2/*` go unresolved and the rule silently passes.
   {
@@ -96,7 +143,7 @@ export default tseslint.config(
     settings: {
       "import-x/resolver-next": [
         createTypeScriptImportResolver({
-          project: "./tsconfig.json",
+          project: "./tsconfig.app.json",
           extensions: [".ts", ".d.ts", ".tsx", ".vue", ".js", ".mjs", ".json"],
         }),
       ],
@@ -114,13 +161,52 @@ export default tseslint.config(
       ],
     },
   },
-  // typescript-eslint scopes these TS-redundant core rules to .ts files only.
-  { ...tseslint.configs.eslintRecommended, files: ["**/*.vue"] },
+  // The md-editor config (raw HTML, XSS filter) runs from the module the bare
+  // `md-editor-v3` alias points at; a deep import would skip it.
+  {
+    files: ["src/**/*.ts", "src/**/*.vue"],
+    ignores: ["src/plugins/mdeditor.ts", "src/plugins/mdeditor-dist.d.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              // Any subpath except a stylesheet.
+              regex: "^md-editor-v3/(?!.*\\.css$)",
+              message:
+                "Import from md-editor-v3 so the config in src/plugins/mdeditor.ts applies.",
+            },
+          ],
+        },
+      ],
+    },
+  },
   {
     // Frozen v1: two cycles between the console theme helpers predate the
     // rule and cannot be refactored under the freeze.
     files: ["src/console/**"],
     rules: { "import-x/no-cycle": "off" },
+  },
+  {
+    files: ["src/**/*.ts", "src/**/*.vue"],
+    ignores: [
+      "src/views/**",
+      "src/components/**",
+      "src/console/**",
+      "src/layouts/**",
+      // The lazy-loaded md-editor modules, the editor's global config, and the
+      // view that reaches md-editor only through an async chunk.
+      "src/plugins/mdeditor*.ts",
+      "src/v2/components/shared/markdown*.ts",
+      "src/v2/components/GameDetails/MarkdownViewer.vue",
+    ],
+    rules: {
+      "@typescript-eslint/no-restricted-imports": [
+        "error",
+        { patterns: heavyImports },
+      ],
+    },
   },
   // v2 primitives: no stores, services, i18n, emitter, or product domain.
   {
@@ -144,6 +230,8 @@ export default tseslint.config(
               message: "Primitives accept a RouterLink `to`, not the router.",
             },
           ],
+          // Rule options replace, not merge, across blocks, so repeat the heavy list.
+          patterns: heavyImports,
         },
       ],
       // Matches resolved files, so every alias and relative spelling is covered.
@@ -208,9 +296,44 @@ export default tseslint.config(
     files: ["src/v2/**/*.ts", "src/v2/**/*.vue"],
     plugins: { romm },
     rules: {
-      "romm/no-emdash-in-comment": "error",
       "romm/no-color-literal": "error",
       "romm/no-layout-media-query": "error",
+      "romm/no-safe-area-env": "error",
+    },
+  },
+  // Stored preferences follow the signed-in user; frozen v1 keeps its keys.
+  {
+    files: ["src/**/*.ts", "src/**/*.vue"],
+    ignores: [
+      "src/views/**",
+      "src/components/**",
+      "src/console/**",
+      "src/layouts/**",
+      "**/*.stories.ts",
+      "**/*.test.ts",
+      "src/composables/useUserLocalStorage.ts",
+    ],
+    plugins: { romm },
+    rules: { "romm/no-unscoped-local-storage": "error" },
+  },
+  {
+    files: ["src/v2/**/*.ts", "src/v2/**/*.vue"],
+    ignores: ["**/*.stories.ts", "**/*.test.ts", "src/v2/utils/autofocus.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: "CallExpression[callee.property.name='focus']",
+          message:
+            "Focus through focusFromInput from @/v2/utils/autofocus, so keyboard and gamepad moves show the focus ring.",
+        },
+        {
+          selector:
+            "CallExpression[callee.object.name='emitter'][callee.property.name='on']",
+          message:
+            "Subscribe with useEmitterEvent from @/v2/composables/useEmitterEvent, which unsubscribes when the component unmounts.",
+        },
+      ],
     },
   },
   {
@@ -224,15 +347,50 @@ export default tseslint.config(
     rules: {
       "no-restricted-syntax": [
         "error",
-        {
-          selector:
-            "TSAsExpression[expression.type='TSAsExpression'][expression.typeAnnotation.type='TSUnknownKeyword'][typeAnnotation.typeName.name=/^(DetailedRom|SimpleRom)$/]",
-          message:
-            "Build ROM fixtures with makeRom or makeDetailedRom from @/utils/rom.fixtures instead of `as unknown as`.",
-        },
+        romCastRule,
+        platformCastRule,
+        modelCastRule,
       ],
     },
   },
+  {
+    files: ["src/v2/**/*.stories.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        romCastRule,
+        platformCastRule,
+        modelCastRule,
+      ],
+    },
+  },
+  // Typed lint cannot resolve SFC imports or `<script setup generic>`, so
+  // component types reach it as `any`: unions with one look redundant and
+  // assertions to one look unnecessary, though vue-tsc needs both.
+  {
+    rules: {
+      "@typescript-eslint/no-redundant-type-constituents": "off",
+      "@typescript-eslint/no-unnecessary-type-assertion": "off",
+    },
+  },
+  {
+    // `expect(obj.method)` reads a spy without calling it.
+    files: ["**/*.test.ts"],
+    rules: { "@typescript-eslint/unbound-method": "off" },
+  },
+  // Frozen v1 cannot take the type-aware fixes, so it skips typed linting.
+  {
+    files: [
+      "src/views/**",
+      "src/components/**",
+      "src/console/**",
+      "src/layouts/**",
+    ],
+    extends: [vueTsConfigs.disableTypeChecked],
+    languageOptions: { parserOptions: { projectService: false } },
+  },
+  // After the base configs, so its exceptions win.
+  ...e2eConfig,
   // Keep last: Prettier owns formatting, so this switches off every
   // stylistic rule the two tools would otherwise fight over.
   prettierConfig,

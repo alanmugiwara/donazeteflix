@@ -10,14 +10,7 @@
 // `MoreMenu` dropdown on the three-dots button. Right-click is left to
 // the browser so "Open in new tab" etc. keep working.
 import { useEventListener, useThrottleFn } from "@vueuse/core";
-import {
-  defineAsyncComponent,
-  onBeforeUnmount,
-  onMounted,
-  provide,
-  ref,
-  watch,
-} from "vue";
+import { defineAsyncComponent, onBeforeUnmount, onMounted, watch } from "vue";
 import { useRouter } from "vue-router";
 import socket from "@/services/socket";
 import storeCollections from "@/stores/collections";
@@ -31,7 +24,7 @@ import BottomNav from "@/v2/components/AppShell/BottomNav.vue";
 import CrtOverlay from "@/v2/components/AppShell/CrtOverlay.vue";
 import GlobalDialogs from "@/v2/components/Dialogs/GlobalDialogs.vue";
 import SoundtrackMiniPlayer from "@/v2/components/Soundtrack/MiniPlayer.vue";
-import { BACKGROUND_ART_KEY } from "@/v2/composables/useBackgroundArt";
+import { provideBackgroundArt } from "@/v2/composables/useBackgroundArt";
 import { installBreakpointAttribute } from "@/v2/composables/useBreakpoint";
 import { installPermissionsHydration } from "@/v2/composables/useCan";
 import { useDebugMode } from "@/v2/composables/useDebugMode";
@@ -123,16 +116,19 @@ watch(
 // notice. Re-asked when the window comes back, which is when whatever did the
 // installing has just been in front. Throttled because alt-tabbing is cheap
 // and the shell answers this off the filesystem; a no-op outside the shell.
+// No trailing call: a refocus inside the window would queue a second forced
+// probe of every platform.
 const NATIVE_REPROBE_THROTTLE_MS = 10_000;
-useEventListener(
-  window,
-  "focus",
-  useThrottleFn(() => {
+const reprobeNative = useThrottleFn(
+  () => {
     const slugs = platformsStore.allPlatforms.map((p) => p.slug);
     if (slugs.length === 0) return;
     void nativeStore.probe(slugs, { force: true });
-  }, NATIVE_REPROBE_THROTTLE_MS),
+  },
+  NATIVE_REPROBE_THROTTLE_MS,
+  false,
 );
+useEventListener(window, "focus", () => void reprobeNative());
 
 // Developer debug overlay: opt-in via Settings → Developer (per-device).
 // Lazily loaded so its chunk (and the vueuse perf hooks it pulls in) is only
@@ -142,39 +138,7 @@ const DebugOverlay = defineAsyncComponent(
   () => import("@/v2/components/AppShell/DebugOverlay.vue"),
 );
 
-// Shared reactive background art: views paint covers via the injected setter.
-const layerA = ref<string | null>(null);
-const layerB = ref<string | null>(null);
-const activeLayer = ref<"a" | "b">("a");
-
-// Dwell before applying a backdrop swap. Without it, dragging the cursor
-// across the gallery would trigger one cross-fade per card and the
-// 700ms fades collide as flashes; the latest call wins after the dwell.
-const BG_HOVER_DWELL_MS = 80;
-let bgTimer: ReturnType<typeof setTimeout> | null = null;
-
-function setBackgroundArt(url: string | null) {
-  const current = activeLayer.value === "a" ? layerA.value : layerB.value;
-  if (current === url) {
-    if (bgTimer !== null) {
-      clearTimeout(bgTimer);
-      bgTimer = null;
-    }
-    return;
-  }
-  if (bgTimer !== null) clearTimeout(bgTimer);
-  bgTimer = setTimeout(() => {
-    bgTimer = null;
-    if (activeLayer.value === "a") {
-      layerB.value = url;
-      activeLayer.value = "b";
-    } else {
-      layerA.value = url;
-      activeLayer.value = "a";
-    }
-  }, BG_HOVER_DWELL_MS);
-}
-provide(BACKGROUND_ART_KEY, setBackgroundArt);
+const { layerA, layerB, activeLayer } = provideBackgroundArt();
 
 const { install: installInputModality } = useInputModality();
 const { install: installGamepad } = useGamepad();
@@ -245,10 +209,6 @@ onBeforeUnmount(() => {
   removeOverlayRouteDismiss = null;
   removeQueryNavigationGuard?.();
   removeQueryNavigationGuard = null;
-  if (bgTimer !== null) {
-    clearTimeout(bgTimer);
-    bgTimer = null;
-  }
   // Leaving v2 (e.g. switching back to the v1 UI): drop the root flag so
   // the class doesn't linger on a non-v2 document.
   document.documentElement.classList.remove("r-v2-reduced-motion");
@@ -304,6 +264,8 @@ onBeforeUnmount(() => {
 
 .r-v2-app-shell__body {
   position: relative;
+  /* Keeps content clear of a landscape phone's notch. */
+  padding-inline: var(--r-safe-l) var(--r-safe-r);
   z-index: 2;
   /* Matches .r-v2-app-shell so the absolutely-positioned BottomNav anchor
      spans the viewport even when the content is shorter than the screen. */
@@ -324,6 +286,6 @@ onBeforeUnmount(() => {
    (galleries) subtract the same amount from their height calc so the
    totals still sum to one viewport with no document overflow. */
 html[data-bp~="sm-and-down"] .r-v2-app-shell__main {
-  padding-bottom: calc(var(--r-bottom-nav-h) + env(safe-area-inset-bottom));
+  padding-bottom: calc(var(--r-bottom-nav-h) + var(--r-safe-b));
 }
 </style>

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ref } from "vue";
 import type { SimpleRom } from "@/stores/roms";
-import { makeRom as baseRom } from "@/utils/rom.fixtures";
+import { romFixture } from "@/utils/rom.fixtures";
 import { useCanPlay } from "./index";
 
 // Each engine's support check is stubbed so a test can enable one route at a
@@ -11,6 +11,8 @@ const support = vi.hoisted(() => ({
   jsDos: vi.fn(() => false),
   pico8: vi.fn(() => false),
   pico8Rom: vi.fn(() => false),
+  easyRpg: vi.fn(() => false),
+  easyRpgGame: vi.fn(() => false),
   ruffle: vi.fn(() => false),
   // js-dos also demands its own bundle format; on by default so the engine
   // stubs stay the only variable.
@@ -35,6 +37,12 @@ vi.mock("@/stores/streaming", () => ({
     containerForPlatform: () => streamContainer.value,
   }),
 }));
+const canStartStream = ref(true);
+const canPlayInBrowser = ref(true);
+vi.mock("@/v2/composables/useCan", () => ({
+  useCan: (action: string) =>
+    action === "rom.play" ? canPlayInBrowser : canStartStream,
+}));
 vi.mock("@/stores/native", () => ({
   useNativeStore: () => ({
     isSupportedPlatform: () => nativeSupported.value,
@@ -45,12 +53,14 @@ vi.mock("@/utils", () => ({
   isJsDosEmulationSupported: support.jsDos,
   isPico8EmulationSupported: support.pico8,
   isPico8Rom: support.pico8Rom,
+  isEasyRpgEmulationSupported: support.easyRpg,
+  isEasyRpgGame: support.easyRpgGame,
   isRuffleEmulationSupported: support.ruffle,
   isJsDosBundle: support.jsDosBundle,
 }));
 
-function makeRom(overrides: Partial<SimpleRom> = {}): SimpleRom {
-  return baseRom({
+function playableRom(overrides: Partial<SimpleRom> = {}): SimpleRom {
+  return romFixture({
     name: "Chrono Trigger",
     platform_slug: "snes",
     has_file_on_disk: true,
@@ -63,15 +73,13 @@ beforeEach(() => {
   support.jsDos.mockReturnValue(false);
   support.pico8.mockReturnValue(false);
   support.pico8Rom.mockReturnValue(false);
+  support.easyRpg.mockReturnValue(false);
+  support.easyRpgGame.mockReturnValue(false);
   support.ruffle.mockReturnValue(false);
   support.jsDosBundle.mockReturnValue(true);
-  support.ejs.mockClear();
-  support.jsDos.mockClear();
-  support.pico8.mockClear();
-  support.pico8Rom.mockClear();
-  support.ruffle.mockClear();
-  support.jsDosBundle.mockClear();
   streamContainer.value = null;
+  canStartStream.value = true;
+  canPlayInBrowser.value = true;
   nativeSupported.value = false;
 });
 
@@ -80,13 +88,14 @@ describe("useCanPlay", () => {
     ["EJS", "ejs", "canPlayEJS", []],
     ["js-dos", "jsDos", "canPlayJsDos", []],
     ["PICO-8", "pico8", "canPlayPico8", ["pico8Rom"]],
+    ["EasyRPG", "easyRpg", "canPlayEasyRpg", ["easyRpgGame"]],
     ["Ruffle", "ruffle", "canPlayRuffle", []],
   ] as const)(
     "reports %s support on its own flag",
     (_label, stub, flag, alsoRequires) => {
       support[stub].mockReturnValue(true);
       for (const extra of alsoRequires) support[extra].mockReturnValue(true);
-      const result = useCanPlay(() => makeRom());
+      const result = useCanPlay(() => playableRom());
 
       expect(result[flag].value).toBe(true);
       expect(result.canPlay.value).toBe(true);
@@ -95,12 +104,12 @@ describe("useCanPlay", () => {
 
   // A physical game, or one whose file vanished from the library, has nothing
   // to hand the emulator: every route boots from the download endpoint.
-  it.each(["ejs", "jsDos", "pico8", "ruffle"] as const)(
+  it.each(["ejs", "jsDos", "pico8", "easyRpg", "ruffle"] as const)(
     "refuses %s for a rom with no file on disk",
     (stub) => {
       support[stub].mockReturnValue(true);
       const { canPlay } = useCanPlay(() =>
-        makeRom({ has_file_on_disk: false }),
+        playableRom({ has_file_on_disk: false }),
       );
 
       expect(canPlay.value).toBe(false);
@@ -113,6 +122,8 @@ describe("useCanPlay", () => {
     support.jsDos.mockReturnValue(true);
     support.pico8.mockReturnValue(true);
     support.pico8Rom.mockReturnValue(true);
+    support.easyRpg.mockReturnValue(true);
+    support.easyRpgGame.mockReturnValue(true);
     support.ruffle.mockReturnValue(true);
     streamContainer.value = {};
     nativeSupported.value = true;
@@ -121,6 +132,7 @@ describe("useCanPlay", () => {
       canPlayEJS,
       canPlayJsDos,
       canPlayPico8,
+      canPlayEasyRpg,
       canPlayRuffle,
       canPlayStream,
       canPlayNative,
@@ -130,6 +142,7 @@ describe("useCanPlay", () => {
     expect(canPlayEJS.value).toBe(false);
     expect(canPlayJsDos.value).toBe(false);
     expect(canPlayPico8.value).toBe(false);
+    expect(canPlayEasyRpg.value).toBe(false);
     expect(canPlayRuffle.value).toBe(false);
     expect(canPlayStream.value).toBe(false);
     expect(canPlayNative.value).toBe(false);
@@ -139,7 +152,7 @@ describe("useCanPlay", () => {
   // rom playable on its own even where no in-browser engine can touch it.
   it("reports streaming support on its own flag", () => {
     streamContainer.value = {};
-    const { canPlay, canPlayStream } = useCanPlay(() => makeRom());
+    const { canPlay, canPlayStream } = useCanPlay(() => playableRom());
 
     expect(canPlayStream.value).toBe(true);
     expect(canPlay.value).toBe(true);
@@ -150,18 +163,55 @@ describe("useCanPlay", () => {
   it("refuses streaming for a rom with no file on disk", () => {
     streamContainer.value = {};
     const { canPlay, canPlayStream } = useCanPlay(() =>
-      makeRom({ has_file_on_disk: false }),
+      playableRom({ has_file_on_disk: false }),
     );
 
     expect(canPlayStream.value).toBe(false);
     expect(canPlay.value).toBe(false);
   });
 
+  it.each([
+    ["EJS", "ejs", "canPlayEJS", []],
+    ["js-dos", "jsDos", "canPlayJsDos", []],
+    ["PICO-8", "pico8", "canPlayPico8", ["pico8Rom"]],
+    ["EasyRPG", "easyRpg", "canPlayEasyRpg", ["easyRpgGame"]],
+    ["Ruffle", "ruffle", "canPlayRuffle", []],
+  ] as const)(
+    "withholds %s without the in-browser play grant",
+    (_label, stub, flag, alsoRequires) => {
+      support[stub].mockReturnValue(true);
+      for (const extra of alsoRequires) support[extra].mockReturnValue(true);
+      canPlayInBrowser.value = false;
+      const result = useCanPlay(() => playableRom());
+
+      expect(result[flag].value).toBe(false);
+      expect(result.canPlay.value).toBe(false);
+    },
+  );
+
+  it("still streams without the in-browser play grant", () => {
+    streamContainer.value = {};
+    canPlayInBrowser.value = false;
+    const { canPlay, canPlayStream } = useCanPlay(() => playableRom());
+
+    expect(canPlayStream.value).toBe(true);
+    expect(canPlay.value).toBe(true);
+  });
+
+  it("reaches a stream it may not start", () => {
+    streamContainer.value = {};
+    canStartStream.value = false;
+    const { canReachStream, canPlayStream } = useCanPlay(() => playableRom());
+
+    expect(canReachStream.value).toBe(true);
+    expect(canPlayStream.value).toBe(false);
+  });
+
   // The desktop shell runs a locally installed emulator, so it makes a rom
   // playable on its own even where nothing on the server can touch it.
   it("reports native support on its own flag", () => {
     nativeSupported.value = true;
-    const { canPlay, canPlayNative } = useCanPlay(() => makeRom());
+    const { canPlay, canPlayNative } = useCanPlay(() => playableRom());
 
     expect(canPlayNative.value).toBe(true);
     expect(canPlay.value).toBe(true);
@@ -172,7 +222,7 @@ describe("useCanPlay", () => {
   it("refuses native play for a rom with no file on disk", () => {
     nativeSupported.value = true;
     const { canPlay, canPlayNative } = useCanPlay(() =>
-      makeRom({ has_file_on_disk: false }),
+      playableRom({ has_file_on_disk: false }),
     );
 
     expect(canPlayNative.value).toBe(false);
@@ -184,7 +234,7 @@ describe("useCanPlay", () => {
   it("refuses js-dos for a rom that is not a bundle", () => {
     support.jsDos.mockReturnValue(true);
     support.jsDosBundle.mockReturnValue(false);
-    const { canPlay, canPlayJsDos } = useCanPlay(() => makeRom());
+    const { canPlay, canPlayJsDos } = useCanPlay(() => playableRom());
 
     expect(canPlayJsDos.value).toBe(false);
     expect(canPlay.value).toBe(false);
@@ -193,26 +243,36 @@ describe("useCanPlay", () => {
   it("refuses PICO-8 for a rom with another extension", () => {
     support.pico8.mockReturnValue(true);
     support.pico8Rom.mockReturnValue(false);
-    const { canPlay, canPlayPico8 } = useCanPlay(() => makeRom());
+    const { canPlay, canPlayPico8 } = useCanPlay(() => playableRom());
 
     expect(canPlayPico8.value).toBe(false);
     expect(canPlay.value).toBe(false);
   });
 
+  // The web player fetches each file on demand, so it cannot open an archive.
+  it("refuses EasyRPG for a rom that is not an extracted game folder", () => {
+    support.easyRpg.mockReturnValue(true);
+    support.easyRpgGame.mockReturnValue(false);
+    const { canPlay, canPlayEasyRpg } = useCanPlay(() => playableRom());
+
+    expect(canPlayEasyRpg.value).toBe(false);
+    expect(canPlay.value).toBe(false);
+  });
+
   it("stays unplayable when no engine supports the platform", () => {
-    const { canPlay } = useCanPlay(() => makeRom());
+    const { canPlay } = useCanPlay(() => playableRom());
 
     expect(canPlay.value).toBe(false);
   });
 
   it("re-evaluates when the rom behind the getter changes", () => {
     support.jsDos.mockReturnValue(true);
-    const rom = ref(makeRom({ has_file_on_disk: false }));
+    const rom = ref(playableRom({ has_file_on_disk: false }));
     const { canPlay } = useCanPlay(() => rom.value);
 
     expect(canPlay.value).toBe(false);
 
-    rom.value = makeRom();
+    rom.value = playableRom();
     expect(canPlay.value).toBe(true);
   });
 });

@@ -2,6 +2,8 @@ import type { Meta, StoryObj } from "@storybook/vue3-vite";
 import { expect, userEvent, within, waitFor } from "storybook/test";
 import { ref } from "vue";
 import type { Platform } from "@/stores/platforms";
+import { platformFixture } from "@/utils/platform.fixtures";
+import { a11yTodoRules, CONTRAST_TODO_PARAMETERS } from "@/v2/utils/storyA11y";
 import PlatformSelect from "./PlatformSelect.vue";
 import {
   formatPlatformRomCount,
@@ -9,106 +11,72 @@ import {
   promotePlatformsWithGamesFirst,
 } from "./platformSelect";
 
-function makePlatform(overrides: Partial<Platform> = {}): Platform {
-  const slug = overrides.slug ?? "platform";
-  return {
-    id: -1,
-    slug,
-    fs_slug: overrides.fs_slug ?? slug,
-    rom_count: 0,
-    name: overrides.name ?? "Platform",
-    igdb_slug: null,
-    moby_slug: null,
-    hltb_slug: null,
-    libretro_slug: null,
-    created_at: "",
-    updated_at: "",
-    fs_size_bytes: 0,
-    is_unidentified: false,
-    is_identified: true,
-    missing_from_fs: false,
-    display_name: overrides.display_name ?? "Platform",
-    firmware_count: 0,
-    ...overrides,
-  };
-}
-
 /** Catalog-scale rom counts; PSX is NTSC-U + NTSC-J (~1,278 + ~2,278). */
 const PSX_CATALOG_ROM_COUNT = 1278 + 2278;
 
 const MIXED_PLATFORM_CATALOG: Platform[] = [
-  makePlatform({
+  platformFixture({
     id: 101,
     slug: "3do",
     name: "3DO Interactive Multiplayer",
-    display_name: "3DO Interactive Multiplayer",
     rom_count: 0,
   }),
-  makePlatform({
+  platformFixture({
     id: 102,
     slug: "ags",
     name: "Adventure Game Studio",
-    display_name: "Adventure Game Studio",
     rom_count: 0,
   }),
-  makePlatform({
+  platformFixture({
     id: 103,
     slug: "amiga",
     name: "Amiga",
-    display_name: "Amiga",
     rom_count: 0,
   }),
-  makePlatform({
+  platformFixture({
     id: 4,
     slug: "gba",
     name: "Game Boy Advance",
-    display_name: "Game Boy Advance",
     rom_count: 1537,
   }),
-  makePlatform({
+  platformFixture({
     id: 5,
     slug: "n64",
     name: "Nintendo 64",
-    display_name: "Nintendo 64",
     rom_count: 389,
   }),
-  makePlatform({
+  platformFixture({
     id: 6,
     slug: "psx",
     name: "PlayStation",
-    display_name: "PlayStation",
     rom_count: PSX_CATALOG_ROM_COUNT,
   }),
-  makePlatform({
+  platformFixture({
     id: 7,
     slug: "nes",
     name: "Nintendo Entertainment System",
-    display_name: "Nintendo Entertainment System",
     rom_count: 722,
   }),
-  makePlatform({
+  platformFixture({
     id: 8,
     slug: "zx80",
     name: "ZX80",
-    display_name: "ZX80",
     rom_count: 0,
   }),
 ];
 
 /** One over-cap library plus a normal count for badge formatting. */
 const ROM_COUNT_CAP_FIXTURE: Platform[] = [
-  makePlatform({
+  platformFixture({
     id: 1,
     slug: "psx",
     name: "PlayStation",
-    display_name: "PlayStation",
     rom_count: PLATFORM_ROM_COUNT_CAP + 2345,
   }),
-  makePlatform({
+  platformFixture({
     id: 2,
     slug: "gba",
     name: "Game Boy Advance",
-    display_name: "Game Boy Advance",
     rom_count: 99,
   }),
 ];
@@ -150,17 +118,23 @@ async function openMenu(canvasElement: HTMLElement) {
   await userEvent.click(
     within(canvasElement).getByRole("button", { name: "Platforms" }),
   );
-  await waitFor(() => {
-    expect(document.querySelector(".r-select__panel")).not.toBeNull();
+  await waitFor(async () => {
+    await expect(document.querySelector(".r-select__panel")).not.toBeNull();
   });
 }
 
-const meta: Meta<typeof PlatformSelect> = {
+// The open panel's option list scrolls but can't take keyboard focus.
+const OPEN_PANEL_A11Y_TODO = a11yTodoRules(
+  "color-contrast",
+  "scrollable-region-focusable",
+);
+
+// Generic components can't fill Storybook's `component` slot, so it's cast;
+// the instantiation types the stories' args.
+const meta: Meta<typeof PlatformSelect<number | null>> = {
   title: "Shared/PlatformSelect",
-  component: PlatformSelect,
-  parameters: {
-    layout: "padded",
-  },
+  component: PlatformSelect as never,
+  parameters: { ...CONTRAST_TODO_PARAMETERS, layout: "padded" },
   decorators: [
     () => ({
       template: `<div style="width:min(360px,100%);padding-top:8px"><story /></div>`,
@@ -191,6 +165,7 @@ export const PromotedOnPage: Story = {
 
 export const PromotedOpenMenu: Story = {
   name: "Promotion on — open menu, do not type",
+  parameters: OPEN_PANEL_A11Y_TODO,
   render: promoteFilledRender(),
   play: async ({ canvasElement, step }) => {
     await step("open menu (do not type in search)", async () => {
@@ -201,7 +176,7 @@ export const PromotedOpenMenu: Story = {
       const { promoted, remaining } = promotePlatformsWithGamesFirst(
         MIXED_PLATFORM_CATALOG,
       );
-      expect(menuRowTitles()).toEqual([
+      await expect(menuRowTitles()).toEqual([
         ...promoted.map((p) => p.display_name),
         "---",
         ...remaining.map((p) => p.display_name),
@@ -212,7 +187,7 @@ export const PromotedOpenMenu: Story = {
       const gbaRow = document.querySelector(
         ".r-select__list > li:not(.r-select__divider)",
       );
-      expect(
+      await expect(
         gbaRow?.querySelector(".r-v2-platsel__rom-badge")?.textContent,
       ).toBe("1537");
     });
@@ -236,11 +211,11 @@ export const PromotedRomCountCap: Story = {
     });
 
     await step("caps badge at 9999+", async () => {
-      await waitFor(() => {
-        expect(romBadgeText("PlayStation")).toBe(
+      await waitFor(async () => {
+        await expect(romBadgeText("PlayStation")).toBe(
           formatPlatformRomCount(PLATFORM_ROM_COUNT_CAP + 2345),
         );
-        expect(romBadgeText("Game Boy Advance")).toBe("99");
+        await expect(romBadgeText("Game Boy Advance")).toBe("99");
       });
     });
   },
@@ -259,20 +234,21 @@ export const PromotedTypingInSearch: Story = {
       const search = document.querySelector(
         ".r-select__search input",
       ) as HTMLInputElement;
-      expect(search).not.toBeNull();
+      await expect(search).not.toBeNull();
       await userEvent.click(search);
       await userEvent.type(search, searchCharacter);
     });
 
     await step("no partition; caller item order", async () => {
-      await waitFor(() => {
+      await waitFor(async () => {
         const rows = menuRowTitles();
-        expect(rows).not.toContain("---");
-        const expected = MIXED_PLATFORM_CATALOG.filter((p) =>
-          p.display_name.toLowerCase().includes(searchCharacter),
-        ).map((p) => p.display_name);
-        expect(rows).toEqual(expected);
-        expect(
+        await expect(rows).not.toContain("---");
+        await expect(rows).toEqual([
+          "Adventure Game Studio",
+          "Amiga",
+          "Game Boy Advance",
+        ]);
+        await expect(
           document.querySelectorAll(".r-v2-platsel__rom-badge"),
         ).toHaveLength(0);
       });
@@ -282,6 +258,7 @@ export const PromotedTypingInSearch: Story = {
 
 export const PromotedSearchDisabled: Story = {
   name: "Promotion on — search field disabled",
+  parameters: OPEN_PANEL_A11Y_TODO,
   render: () => ({
     components: { PlatformSelect },
     setup() {
@@ -294,14 +271,14 @@ export const PromotedSearchDisabled: Story = {
   play: async ({ canvasElement, step }) => {
     await step("open menu", async () => {
       await openMenu(canvasElement);
-      expect(document.querySelector(".r-select__search")).toBeNull();
+      await expect(document.querySelector(".r-select__search")).toBeNull();
     });
 
     await step("still partitioned", async () => {
       const { promoted, remaining } = promotePlatformsWithGamesFirst(
         MIXED_PLATFORM_CATALOG,
       );
-      expect(menuRowTitles()).toEqual([
+      await expect(menuRowTitles()).toEqual([
         ...promoted.map((p) => p.display_name),
         "---",
         ...remaining.map((p) => p.display_name),
@@ -323,4 +300,40 @@ export const PromotedAllLibrariesEmpty: Story = {
     },
     template: `<PlatformSelect v-model="value" :items="items" label="Platforms" :promote-filled="true" />`,
   }),
+};
+
+export const ScanPagePicker: Story = {
+  name: "Scan page picker, promotion on",
+  parameters: OPEN_PANEL_A11Y_TODO,
+  render: () => ({
+    components: { PlatformSelect },
+    setup() {
+      const value = ref<string[]>([]);
+      const items = ref<Platform[]>([...MIXED_PLATFORM_CATALOG]);
+      return { value, items };
+    },
+    // The same props Scan.vue passes.
+    template: `<PlatformSelect v-model="value" :items="items" item-key="fs_slug" label="Platforms" multiple clearable hide-details chips show-meta mark-unscanned show-all-option promote-filled />`,
+  }),
+  play: async ({ canvasElement, step }) => {
+    await step("open menu", async () => {
+      await openMenu(canvasElement);
+    });
+
+    await step(
+      "platforms with games come first, below the All row",
+      async () => {
+        const { promoted, remaining } = promotePlatformsWithGamesFirst(
+          MIXED_PLATFORM_CATALOG,
+        );
+        await expect(menuRowTitles()).toEqual([
+          "All",
+          "---",
+          ...promoted.map((p) => p.display_name),
+          "---",
+          ...remaining.map((p) => p.display_name),
+        ]);
+      },
+    );
+  },
 };

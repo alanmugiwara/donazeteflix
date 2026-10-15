@@ -1,11 +1,15 @@
-import { RBtn } from "@v2/lib";
+import { RBtn, RSlider } from "@v2/lib";
 import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { defineComponent, type Slots, type VNodeChild } from "vue";
-import type { SaveSchema, StateSchema } from "@/__generated__";
+import { defineComponent, nextTick, type Slots, type VNodeChild } from "vue";
+import type {
+  SaveSchema,
+  StateSchema,
+  StreamStatePicksSchema,
+} from "@/__generated__";
 import type { DetailedRom } from "@/stores/roms";
 import { saveFixture, stateFixture } from "@/utils/assets.fixtures";
-import { makeDetailedRom } from "@/utils/rom.fixtures";
+import { detailedRomFixture } from "@/utils/rom.fixtures";
 import AssetPreview from "@/v2/components/Player/AssetPreview.vue";
 import SaveDataPanel from "@/v2/components/Player/SaveDataPanel.vue";
 import AssetList from "@/v2/components/shared/AssetList.vue";
@@ -13,7 +17,8 @@ import Stream from "./Stream.vue";
 
 const mocks = vi.hoisted(() => ({
   claimSession: vi.fn(),
-  fetchConfig: vi.fn(),
+  fetchConfig: vi.fn(() => Promise.resolve()),
+  fetchStatePicks: vi.fn(),
   getRom: vi.fn(),
   fetchSessionStatus: vi.fn(),
   heartbeatSession: vi.fn(),
@@ -24,9 +29,13 @@ const mocks = vi.hoisted(() => ({
   saveAndExitKeepalive: vi.fn(),
   loadState: vi.fn(),
   saveState: vi.fn(),
+  setVolume: vi.fn(),
   container: null as Record<string, unknown> | null,
   capabilities: {} as Record<string, unknown>,
+  // Reactive once the store mock loads, so a test can turn streaming off.
+  streamingOff: { value: false },
   presenceTick: null as (() => Promise<void>) | null,
+  playSession: { start: vi.fn(), flush: vi.fn() },
   socketHandlers: {} as Record<string, (payload: unknown) => unknown>,
   query: {} as Record<string, string>,
   snackbar: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
@@ -53,8 +62,10 @@ vi.mock("@/services/api/rom", () => ({
 
 vi.mock("@/services/api/streaming", () => ({
   default: {
+    fetchStatePicks: mocks.fetchStatePicks,
     loadState: mocks.loadState,
     saveState: mocks.saveState,
+    setVolume: mocks.setVolume,
   },
   isMemoryCardImportDetail: () => false,
 }));
@@ -75,24 +86,30 @@ vi.mock("@/v2/stores/galleryRoms", () => ({
   default: () => ({ getRomById: () => null }),
 }));
 
-vi.mock("@/stores/streaming", () => ({
-  useStreamingStore: () => ({
-    claimSession: mocks.claimSession,
-    containerForPlatform: () => mocks.container,
-    emulatorLabel: (emulator: string) =>
-      emulator === "duckstation" ? "DuckStation" : emulator,
-    platformCapabilities: () => mocks.capabilities,
-    fetchConfig: mocks.fetchConfig,
-    fetchSessionStatus: mocks.fetchSessionStatus,
-    forgetJoinableSession: vi.fn(),
-    heartbeatSession: mocks.heartbeatSession,
-    joinSession: mocks.joinSession,
-    releaseSession: mocks.releaseSession,
-    releaseSessionKeepalive: mocks.releaseSessionKeepalive,
-    saveAndExit: mocks.saveAndExit,
-    saveAndExitKeepalive: mocks.saveAndExitKeepalive,
-  }),
-}));
+vi.mock("@/stores/streaming", async () => {
+  const { ref } = await import("vue");
+  mocks.streamingOff = ref(false);
+  return {
+    useStreamingStore: () => ({
+      claimSession: mocks.claimSession,
+      containerForPlatform: () =>
+        mocks.streamingOff.value ? null : mocks.container,
+      containerCapabilities: (container: unknown) =>
+        container ? mocks.capabilities : {},
+      emulatorLabel: (emulator: string) =>
+        emulator === "duckstation" ? "DuckStation" : emulator,
+      fetchConfig: mocks.fetchConfig,
+      fetchSessionStatus: mocks.fetchSessionStatus,
+      forgetJoinableSession: vi.fn(),
+      heartbeatSession: mocks.heartbeatSession,
+      joinSession: mocks.joinSession,
+      releaseSession: mocks.releaseSession,
+      releaseSessionKeepalive: mocks.releaseSessionKeepalive,
+      saveAndExit: mocks.saveAndExit,
+      saveAndExitKeepalive: mocks.saveAndExitKeepalive,
+    }),
+  };
+});
 
 vi.mock("@/v2/composables/useActivityPresence", () => ({
   useActivityPresence: (_rom: unknown, tick: () => Promise<void>) => {
@@ -139,7 +156,7 @@ vi.mock("@/v2/composables/useInputModality", async () => {
 vi.mock("@/v2/composables/usePageTitle", () => ({ usePageTitle: vi.fn() }));
 
 vi.mock("@/v2/composables/usePlaySession", () => ({
-  usePlaySession: () => ({ start: vi.fn(), flush: vi.fn() }),
+  usePlaySession: () => mocks.playSession,
 }));
 
 vi.mock("@/v2/composables/useSnackbar", () => ({
@@ -154,6 +171,7 @@ vi.mock("@/v2/composables/useSocketEvent", () => ({
 
 vi.mock("@/v2/composables/useStageActive", () => ({
   useStageActive: vi.fn(),
+  usePlayingWhile: vi.fn(),
 }));
 
 vi.mock("@/v2/composables/useUnloadGuard", () => ({
@@ -185,6 +203,8 @@ const StreamStageStub = exposingStub(
     enterFullscreen: () => Promise.resolve(),
     leaveFullscreen: () => Promise.resolve(),
     focusStream: () => {},
+    // Declines, as a cross-origin container does, so volume goes to the broker.
+    postToStream: () => false,
   },
   (slots) => slots.bar?.({ isFullscreen: false, toggleFullscreen: () => {} }),
 );
@@ -215,7 +235,7 @@ const ARCHIVES = [
 ];
 
 function romWith(saves: SaveSchema[], states: StateSchema[] = []): DetailedRom {
-  return makeDetailedRom({
+  return detailedRomFixture({
     id: 3,
     name: "Archer Maclean's 3D Pool (USA)",
     platform_slug: "gba",
@@ -225,19 +245,8 @@ function romWith(saves: SaveSchema[], states: StateSchema[] = []): DetailedRom {
     user_saves: saves,
     all_user_states: states.map((state) => ({ ...state, username: "admin" })),
     user_screenshots: [],
-    metadatum: {} as DetailedRom["metadatum"],
   });
 }
-
-// The view listens on document and window, so a mount left standing would
-// answer the next test's visibilitychange and pagehide too.
-const mounted: VueWrapper[] = [];
-
-afterEach(() => {
-  for (const wrapper of mounted.splice(0)) {
-    if (wrapper.exists()) wrapper.unmount();
-  }
-});
 
 async function launch(opts: {
   picker: boolean;
@@ -245,7 +254,8 @@ async function launch(opts: {
   states?: StateSchema[];
   liveStates?: boolean;
   imports?: ("save" | "state")[];
-  stateCore?: { expected: string; default_matches: boolean } | null;
+  // The backend's answer; every state is native unless a test says otherwise.
+  picks?: StreamStatePicksSchema | Error | Promise<StreamStatePicksSchema>;
 }): Promise<VueWrapper> {
   mocks.container = {
     name: "WEBSTATION-DEV",
@@ -254,13 +264,19 @@ async function launch(opts: {
     supports_save_picker: opts.picker,
     supports_live_states: opts.liveStates ?? true,
     import_kinds: opts.imports ?? [],
-    state_core: opts.stateCore ?? null,
     supports_memory_cards: false,
     supports_multiplayer: false,
   };
   mocks.getRom.mockResolvedValue({
     data: romWith(opts.saves ?? ARCHIVES, opts.states),
   });
+  const ids = (opts.states ?? []).map((state) => state.id);
+  const picks = opts.picks ?? { native: ids, pickable: ids };
+  mocks.fetchStatePicks.mockImplementation(() =>
+    picks instanceof Error
+      ? Promise.reject(picks)
+      : Promise.resolve(picks).then((data) => ({ data })),
+  );
   const wrapper = mount(Stream, {
     shallow: true,
     global: {
@@ -270,7 +286,6 @@ async function launch(opts: {
       stubs: { GameCover: GameCoverStub, StreamStage: StreamStageStub },
     },
   });
-  mounted.push(wrapper);
   await flushPromises();
   return wrapper;
 }
@@ -305,7 +320,6 @@ function deferClaim(): (claim: typeof CLAIM) => void {
 
 describe("Stream save picker", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     mocks.claimSession.mockResolvedValue(CLAIM);
   });
 
@@ -322,8 +336,7 @@ describe("Stream save picker", () => {
   });
 
   it("dates the rows by the timestamp it sorted them on", async () => {
-    // A content-hash rewrite moves updated_at without touching the save, so
-    // showing it would date the second row "now" in a newest-first list.
+    // The web player writes into its row, so updated_at is the last play.
     const wrapper = await launch({
       picker: true,
       saves: [
@@ -334,9 +347,31 @@ describe("Stream save picker", () => {
       ],
     });
 
-    expect((saveList(wrapper)!.props("assets") as SaveSchema[])[0].id).toBe(3);
-    expect(saveList(wrapper)!.props("timestamp")).toBe("created");
-    expect(preview(wrapper)!.props("timestamp")).toBe("created");
+    expect((saveList(wrapper)!.props("assets") as SaveSchema[])[0]?.id).toBe(1);
+    expect(saveList(wrapper)!.props("timestamp")).toBe("updated");
+    expect(preview(wrapper)!.props("timestamp")).toBe("updated");
+  });
+
+  it("defaults to a bare .srm the web player wrote since the newest archive", async () => {
+    const wrapper = await launch({
+      picker: true,
+      saves: [
+        save(0, "Pool.srm", { updated_at: "2026-09-15T00:00:00" }),
+        ...ARCHIVES,
+      ],
+      imports: ["save"],
+    });
+
+    expect(saveList(wrapper)!.props("selectedId")).toBe(0);
+  });
+
+  it("reads an upper-case .ZIP as this emulator's archive", async () => {
+    const wrapper = await launch({
+      picker: false,
+      saves: [save(4, "POOL.ZIP")],
+    });
+
+    expect(wrapper.findComponent(SaveDataPanel).props("save")?.id).toBe(4);
   });
 
   it("has no clear button: the claim always restores something", async () => {
@@ -353,7 +388,52 @@ describe("Stream save picker", () => {
     expect((preview(wrapper)!.props("asset") as SaveSchema).id).toBe(1);
 
     await (wrapper.vm as unknown as { onPlay: () => Promise<void> }).onPlay();
-    expect(mocks.claimSession.mock.calls[0][2]).toBe(1);
+    expect(mocks.claimSession.mock.calls[0]![2]).toBe(1);
+  });
+
+  it("asks for the config afresh, so a broker that answered late still offers its imports", async () => {
+    // The app-load copy said nothing imports, and there's no archive of
+    // this emulator's own, so without the refetch the picker stays hidden.
+    mocks.fetchConfig.mockImplementationOnce(() => {
+      mocks.container = { ...mocks.container, import_kinds: ["save"] };
+      return Promise.resolve();
+    });
+    const wrapper = await launch({
+      picker: true,
+      saves: [save(9, "Pool.srm", { emulator: "mgba" })],
+    });
+
+    expect(mocks.fetchConfig).toHaveBeenCalled();
+    expect(
+      (saveList(wrapper)!.props("assets") as SaveSchema[]).map((s) => s.id),
+    ).toEqual([9]);
+  });
+
+  it("holds the picker until the fresh config lands", async () => {
+    // Picks made off the app-load copy could vanish once the refetch says
+    // what the broker imports, so nothing is offered before then.
+    let answer!: () => void;
+    mocks.fetchConfig.mockImplementationOnce(
+      () => new Promise<void>((resolve) => (answer = resolve)),
+    );
+    const wrapper = await launch({ picker: true });
+
+    expect(saveList(wrapper)).toBeUndefined();
+    expect(wrapper.findComponent(SaveDataPanel).exists()).toBe(false);
+    expect(wrapper.find(".r-v2-stream__resume-loading").exists()).toBe(true);
+    // Play would send the preselected state the player can't see yet.
+    expect(wrapper.find(".r-v2-stream__play").attributes("disabled")).toBe(
+      "true",
+    );
+
+    answer();
+    await flushPromises();
+
+    expect(wrapper.find(".r-v2-stream__resume-loading").exists()).toBe(false);
+    expect(saveList(wrapper)).toBeDefined();
+    expect(wrapper.find(".r-v2-stream__play").attributes("disabled")).toBe(
+      "false",
+    );
   });
 
   it("includes bare (non-archive) save files where the broker imports saves", async () => {
@@ -366,7 +446,70 @@ describe("Stream save picker", () => {
     expect(
       (saveList(wrapper)!.props("assets") as SaveSchema[]).map((s) => s.id),
     ).toEqual([9, 3, 2, 1]);
+  });
+
+  it("defaults to a newer bare .srm where the broker imports saves", async () => {
+    // A streaming exit or another device files the battery save bare.
+    const wrapper = await launch({
+      picker: true,
+      saves: [
+        save(9, "Pool [2026-09-14_09-00-00].srm", { emulator: "mgba" }),
+        ...ARCHIVES,
+      ],
+      imports: ["save"],
+    });
+
+    expect(saveList(wrapper)!.props("selectedId")).toBe(9);
+  });
+
+  it("leaves an untouched default off the claim, so the backend can fall back", async () => {
+    // Named, a bare .srm the broker then refused would boot with no save.
+    const wrapper = await launch({
+      picker: true,
+      saves: [
+        save(9, "Pool [2026-09-14_09-00-00].srm", { emulator: "mgba" }),
+        ...ARCHIVES,
+      ],
+      imports: ["save"],
+    });
+
+    await wrapper.find(".r-v2-stream__play").trigger("click");
+    await flushPromises();
+    expect(mocks.claimSession).toHaveBeenCalledOnce();
+    expect(mocks.claimSession.mock.calls[0]![2]).toBeUndefined();
+  });
+
+  it("skips a save whose file is missing when defaulting", async () => {
+    const wrapper = await launch({
+      picker: true,
+      saves: [
+        save(9, "Pool.srm", { emulator: "mgba", missing_from_fs: true }),
+        ...ARCHIVES,
+      ],
+      imports: ["save"],
+    });
+
     expect(saveList(wrapper)!.props("selectedId")).toBe(3);
+  });
+
+  it("keeps the newer archive over an older bare .srm", async () => {
+    const wrapper = await launch({
+      picker: true,
+      saves: [...ARCHIVES, save(0, "Pool.srm")],
+      imports: ["save"],
+    });
+
+    expect(saveList(wrapper)!.props("selectedId")).toBe(3);
+  });
+
+  it("reports a newer bare .srm where the container takes no pick", async () => {
+    const wrapper = await launch({
+      picker: false,
+      saves: [save(9, "Pool.srm"), ...ARCHIVES],
+      imports: ["save"],
+    });
+
+    expect(wrapper.findComponent(SaveDataPanel).props("save")?.id).toBe(9);
   });
 
   it("offers another emulator's archives too, still defaulting to this one's newest", async () => {
@@ -424,7 +567,7 @@ describe("Stream save picker", () => {
     expect(saveList(wrapper)!.props("selectedId")).toBe(9);
 
     await (wrapper.vm as unknown as { onPlay: () => Promise<void> }).onPlay();
-    expect(mocks.claimSession.mock.calls[0][2]).toBe(9);
+    expect(mocks.claimSession.mock.calls[0]![2]).toBe(9);
   });
 
   it("reports instead of offering where the emulator keeps its save tree", async () => {
@@ -449,7 +592,7 @@ describe("Stream save picker", () => {
     const wrapper = await launch({ picker: false });
 
     await (wrapper.vm as unknown as { onPlay: () => Promise<void> }).onPlay();
-    expect(mocks.claimSession.mock.calls[0][2]).toBeUndefined();
+    expect(mocks.claimSession.mock.calls[0]![2]).toBeUndefined();
   });
 
   it("falls back to the newest when the picked archive is gone", async () => {
@@ -467,6 +610,8 @@ describe("Stream save picker", () => {
   });
 });
 
+type UserState = DetailedRom["all_user_states"][number];
+
 type StreamVm = {
   onPlay: () => Promise<void>;
   performStop: () => Promise<void>;
@@ -476,10 +621,15 @@ type StreamVm = {
   claimedAt: string | null;
   playerState: string;
   endedDialogOpen: boolean;
+  exitDialogOpen: boolean;
   holdsClaim: boolean;
   containerHost: string;
   errorMessage: string;
   errorHint: string;
+  playReady: boolean;
+  rom: DetailedRom;
+  pickableStates: UserState[];
+  selectedState: UserState | null;
 };
 
 function vmOf(wrapper: VueWrapper): StreamVm {
@@ -487,7 +637,7 @@ function vmOf(wrapper: VueWrapper): StreamVm {
 }
 
 function endSession(notice: Record<string, unknown>): void {
-  const handler = mocks.socketHandlers["streaming:session-ended"];
+  const handler = mocks.socketHandlers["streaming:session-ended"]!;
   expect(handler).toBeTypeOf("function");
   handler({
     ended_by: "admin",
@@ -500,7 +650,7 @@ function endSession(notice: Record<string, unknown>): void {
 async function launchReady(
   payload: Record<string, unknown> = {},
 ): Promise<void> {
-  const handler = mocks.socketHandlers["streaming:launch-ready"];
+  const handler = mocks.socketHandlers["streaming:launch-ready"]!;
   expect(handler).toBeTypeOf("function");
   await handler({
     platform: "gba",
@@ -514,7 +664,7 @@ async function launchReady(
 async function launchFailed(
   payload: Record<string, unknown> = {},
 ): Promise<void> {
-  const handler = mocks.socketHandlers["streaming:launch-failed"];
+  const handler = mocks.socketHandlers["streaming:launch-failed"]!;
   expect(handler).toBeTypeOf("function");
   await handler({
     platform: "gba",
@@ -526,7 +676,6 @@ async function launchFailed(
 
 describe("Stream session-ended notices", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     mocks.claimSession.mockResolvedValue(CLAIM);
   });
 
@@ -626,9 +775,27 @@ describe("Stream session-ended notices", () => {
   });
 });
 
+describe("Stream exit chord", () => {
+  beforeEach(() => {
+    mocks.claimSession.mockResolvedValue(CLAIM);
+  });
+
+  it("opens the exit dialog from the pad's exit chord", async () => {
+    // B is muted with the rest of the pad, so the chord is the pad's way out.
+    const wrapper = await launch({ picker: false });
+    await vmOf(wrapper).onPlay();
+    await launchReady();
+    expect(vmOf(wrapper).playerState).toBe("playing");
+
+    window.dispatchEvent(new Event("gamepad:exitchord"));
+    await flushPromises();
+
+    expect(vmOf(wrapper).exitDialogOpen).toBe(true);
+  });
+});
+
 describe("Stream claim hygiene", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     mocks.claimSession.mockResolvedValue(CLAIM);
     mocks.releaseSession.mockResolvedValue(true);
   });
@@ -711,7 +878,7 @@ describe("Stream claim hygiene", () => {
     wrapper.unmount();
 
     const [platform, , wait, container, claimedAt] =
-      mocks.saveAndExit.mock.calls[0];
+      mocks.saveAndExit.mock.calls[0]!;
     expect([platform, wait, container, claimedAt]).toEqual([
       "gba",
       false,
@@ -728,7 +895,7 @@ describe("Stream claim hygiene", () => {
     window.dispatchEvent(new Event("pagehide"));
 
     const [platform, , container, claimedAt] =
-      mocks.saveAndExitKeepalive.mock.calls[0];
+      mocks.saveAndExitKeepalive.mock.calls[0]!;
     expect([platform, container, claimedAt]).toEqual([
       "gba",
       CLAIM.container,
@@ -745,7 +912,7 @@ describe("Stream claim hygiene", () => {
     await vmOf(wrapper).performSaveAndExit();
 
     const [platform, , wait, container, claimedAt] =
-      mocks.saveAndExit.mock.calls[0];
+      mocks.saveAndExit.mock.calls[0]!;
     expect([platform, wait, container, claimedAt]).toEqual([
       "gba",
       true,
@@ -834,13 +1001,13 @@ describe("Stream claim hygiene", () => {
 
 describe("Stream state controls", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     mocks.claimSession.mockResolvedValue(CLAIM);
     mocks.capabilities = { maxSlots: 0, hasAutosave: true, autosaveSlot: 10 };
   });
 
   afterEach(() => {
     mocks.capabilities = {};
+    mocks.streamingOff.value = false;
   });
 
   async function barIcons(liveStates: boolean): Promise<unknown[]> {
@@ -853,6 +1020,18 @@ describe("Stream state controls", () => {
 
   it("offers Save and Load where the broker takes a state mid-game", async () => {
     const icons = await barIcons(true);
+    expect(icons).toContain("mdi-content-save-outline");
+    expect(icons).toContain("mdi-restore");
+  });
+
+  it("keeps the controls when streaming is revoked mid-game", async () => {
+    const wrapper = await launch({ picker: false });
+    await vmOf(wrapper).onPlay();
+    await launchReady();
+    mocks.streamingOff.value = true;
+    await flushPromises();
+
+    const icons = wrapper.findAllComponents(RBtn).map((b) => b.props("icon"));
     expect(icons).toContain("mdi-content-save-outline");
     expect(icons).toContain("mdi-restore");
   });
@@ -876,7 +1055,6 @@ async function pollStatus(): Promise<void> {
 
 describe("Stream launch recovery", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     mocks.claimSession.mockResolvedValue(CLAIM);
   });
 
@@ -961,6 +1139,16 @@ describe("Stream launch recovery", () => {
     expect(mocks.t).toHaveBeenCalledWith("play.core-untested", {
       core: "bsnes",
     });
+  });
+
+  it("leaves the claim holder's play session to the backend", async () => {
+    const wrapper = await launch({ picker: false });
+    await vmOf(wrapper).onPlay();
+    await launchReady();
+    await flushPromises();
+
+    expect(vmOf(wrapper).playerState).toBe("playing");
+    expect(mocks.playSession.start).not.toHaveBeenCalled();
   });
 
   it("warns of the core once when launch-ready follows the poll", async () => {
@@ -1156,7 +1344,6 @@ describe("Stream launch recovery", () => {
 
 describe("Stream join", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     mocks.joinSession.mockResolvedValue({ host: "http://box:3000/room/x" });
     mocks.query = { join: "1", container: "http://box:8000" };
   });
@@ -1182,82 +1369,190 @@ describe("Stream join", () => {
 
     expect(mocks.joinSession).toHaveBeenCalledWith("gba", undefined);
   });
+
+  it("times the joiner's play session once the stream runs", async () => {
+    await launch({ picker: false });
+    await flushPromises();
+
+    expect(mocks.playSession.start).toHaveBeenCalledOnce();
+    expect(mocks.playSession.start).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 3 }),
+    );
+  });
 });
 
 describe("Stream state picker", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
     mocks.claimSession.mockResolvedValue(CLAIM);
   });
 
   const STATES = [
-    stateFixture({ id: 5, emulator: "retroarch" }),
+    stateFixture({ id: 7, emulator: "retroarch" }),
     stateFixture({ id: 6, emulator: "duckstation" }),
+    stateFixture({ id: 5, emulator: "retroarch" }),
   ];
 
   function pickableStateIds(wrapper: VueWrapper): number[] {
-    return (
-      wrapper.vm as unknown as { pickableStates: StateSchema[] }
-    ).pickableStates.map((s) => s.id);
+    return vmOf(wrapper).pickableStates.map((s) => s.id);
   }
 
-  it("offers only this emulator's states where the broker declares no state import", async () => {
-    const wrapper = await launch({ picker: false, states: STATES });
+  function selectedStateId(wrapper: VueWrapper): number | undefined {
+    return vmOf(wrapper).selectedState?.id;
+  }
 
-    expect(pickableStateIds(wrapper)).toEqual([5]);
+  it("asks the backend which of the rom's states to offer", async () => {
+    await launch({ picker: false, states: STATES });
+
+    expect(mocks.fetchStatePicks).toHaveBeenCalledWith(3);
   });
 
-  it("offers another emulator's states where the broker imports them", async () => {
+  it("offers the picked states in the rom's newest-first order", async () => {
     const wrapper = await launch({
       picker: false,
       states: STATES,
-      imports: ["state"],
+      picks: { native: [5], pickable: [5, 6] },
     });
 
-    expect(pickableStateIds(wrapper)).toEqual([5, 6]);
+    expect(pickableStateIds(wrapper)).toEqual([6, 5]);
   });
 
-  const CORE_STATES = [
-    stateFixture({ id: 5, emulator: "retroarch", core: "bsnes" }),
-    stateFixture({ id: 6, emulator: "retroarch", core: "snes9x" }),
-    stateFixture({ id: 7, emulator: "retroarch", core: null }),
-    stateFixture({ id: 8, emulator: "duckstation", core: null }),
-  ];
-
-  it("hides states another RetroArch core wrote", async () => {
+  it("preselects the newest native state, not a newer import", async () => {
     const wrapper = await launch({
       picker: false,
-      states: CORE_STATES,
-      stateCore: { expected: "bsnes", default_matches: false },
+      states: STATES,
+      picks: { native: [5], pickable: [6, 5] },
     });
 
-    expect(pickableStateIds(wrapper)).toEqual([5]);
+    expect(selectedStateId(wrapper)).toBe(5);
   });
 
-  it("treats a state with no core as the default's", async () => {
+  it("offers nothing when the backend can't say", async () => {
     const wrapper = await launch({
       picker: false,
-      states: CORE_STATES,
-      stateCore: { expected: "snes9x", default_matches: true },
+      states: STATES,
+      picks: new Error("offline"),
     });
 
-    expect(pickableStateIds(wrapper)).toEqual([6, 7]);
+    expect(pickableStateIds(wrapper)).toEqual([]);
+    expect(selectedStateId(wrapper)).toBeUndefined();
   });
 
-  it("filters nothing when the core is unknown", async () => {
-    const wrapper = await launch({ picker: false, states: CORE_STATES });
-
-    expect(pickableStateIds(wrapper)).toEqual([5, 6, 7]);
-  });
-
-  it("keeps foreign states for the import path but still hides other cores", async () => {
+  it("keeps the pick when a refresh of the picks fails", async () => {
     const wrapper = await launch({
       picker: false,
-      states: CORE_STATES,
-      imports: ["state"],
-      stateCore: { expected: "bsnes", default_matches: false },
+      states: STATES,
+      picks: { native: [7, 5], pickable: [7, 6, 5] },
+    });
+    const vm = vmOf(wrapper);
+    vm.selectedState = vm.rom.all_user_states[2]!;
+    mocks.fetchStatePicks.mockRejectedValue(new Error("offline"));
+
+    vm.rom = {
+      ...vm.rom,
+      all_user_states: vm.rom.all_user_states.filter((s) => s.id !== 6),
+    };
+    await flushPromises();
+
+    expect(mocks.fetchStatePicks).toHaveBeenCalledTimes(2);
+    expect(pickableStateIds(wrapper)).toEqual([7, 5]);
+    expect(selectedStateId(wrapper)).toBe(5);
+  });
+
+  it("holds Play until the picks answer", async () => {
+    let answer!: (picks: StreamStatePicksSchema) => void;
+    const wrapper = await launch({
+      picker: false,
+      states: STATES,
+      picks: new Promise((resolve) => (answer = resolve)),
+    });
+    expect(vmOf(wrapper).playReady).toBe(false);
+
+    answer({ native: [5], pickable: [5] });
+    await flushPromises();
+
+    expect(vmOf(wrapper).playReady).toBe(true);
+    expect(selectedStateId(wrapper)).toBe(5);
+  });
+
+  it("frees Play when the picks fail", async () => {
+    const wrapper = await launch({
+      picker: false,
+      states: STATES,
+      picks: new Error("offline"),
     });
 
-    expect(pickableStateIds(wrapper)).toEqual([5, 8]);
+    expect(vmOf(wrapper).playReady).toBe(true);
+    expect(selectedStateId(wrapper)).toBeUndefined();
+  });
+
+  it("asks again only when the answer could change", async () => {
+    const wrapper = await launch({ picker: false, states: STATES });
+    const vm = vmOf(wrapper);
+
+    vm.rom = { ...vm.rom, all_user_states: [...vm.rom.all_user_states] };
+    await flushPromises();
+
+    expect(mocks.fetchStatePicks).toHaveBeenCalledOnce();
+  });
+
+  it("asks again when a state is renamed", async () => {
+    const wrapper = await launch({ picker: false, states: STATES });
+    const vm = vmOf(wrapper);
+
+    vm.rom = {
+      ...vm.rom,
+      all_user_states: vm.rom.all_user_states.map((s) =>
+        s.id === 5 ? { ...s, file_name: "game.state100" } : s,
+      ),
+    };
+    await flushPromises();
+
+    expect(mocks.fetchStatePicks).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Stream volume over the broker", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    mocks.setVolume.mockResolvedValue({});
+  });
+
+  // The volume slider sits in the bar, which a running game puts on screen.
+  async function play(): Promise<VueWrapper> {
+    const wrapper = await launch({ picker: false });
+    await vmOf(wrapper).onPlay();
+    await launchReady();
+    await flushPromises();
+    return wrapper;
+  }
+
+  async function slide(wrapper: VueWrapper, ...levels: number[]) {
+    const slider = wrapper.getComponent(RSlider);
+    for (const level of levels) {
+      slider.vm.$emit("update:modelValue", level);
+      await nextTick();
+    }
+  }
+
+  it("hands the broker a volume only once it settles", async () => {
+    const wrapper = await play();
+
+    await slide(wrapper, 40, 30);
+    await vi.advanceTimersByTimeAsync(149);
+    expect(mocks.setVolume).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mocks.setVolume).toHaveBeenCalledOnce();
+    expect(mocks.setVolume.mock.calls[0]![1]).toBe(30);
+  });
+
+  it("drops a volume still settling when the view unmounts", async () => {
+    const wrapper = await play();
+
+    await slide(wrapper, 40);
+    wrapper.unmount();
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(mocks.setVolume).not.toHaveBeenCalled();
   });
 });

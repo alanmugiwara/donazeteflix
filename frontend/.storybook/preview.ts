@@ -16,6 +16,7 @@ import { installBreakpointAttribute } from "../src/v2/composables/useBreakpoint"
 import { ChromeLabelsKey } from "../src/v2/lib/a11y/chromeLabels";
 import "../src/v2/styles/global.css";
 import { createChromeLabels } from "../src/v2/utils/chromeLabels";
+import "./preview.css";
 import { ROMM_STORYBOOK_VIEWPORTS } from "./rommViewports";
 import {
   INPUT_DEFAULT,
@@ -28,7 +29,7 @@ import {
 installBreakpointAttribute();
 
 // Each story runs inside a Vue app with Pinia + i18n + Vuetify registered.
-// v2 primitives are Vuetify-free at runtime — Vuetify stays registered only
+// v2 primitives are Vuetify-free at runtime: Vuetify stays registered only
 // because some shared dependencies still pull it in. The visible theme for
 // v2 stories comes from the `.r-v2-dark` / `.r-v2-light` class toggled on
 // <html> by the theme switcher decorator below.
@@ -72,6 +73,7 @@ setup((app) => {
 });
 
 const preview: Preview = {
+  tags: ["autodocs"],
   globalTypes: {
     [INPUT_GLOBAL]: INPUT_TOOLBAR,
   },

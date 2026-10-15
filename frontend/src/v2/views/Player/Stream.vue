@@ -27,7 +27,7 @@ import {
   RSwitch,
   RTooltip,
 } from "@v2/lib";
-import { useEventListener, useIntervalFn, useLocalStorage } from "@vueuse/core";
+import { useDebounceFn, useEventListener, useIntervalFn } from "@vueuse/core";
 import { isAxiosError } from "axios";
 import {
   computed,
@@ -35,11 +35,13 @@ import {
   onBeforeUnmount,
   onMounted,
   ref,
+  shallowRef,
   watch,
 } from "vue";
 import { useI18n } from "vue-i18n";
 import { onBeforeRouteLeave, useRoute, useRouter } from "vue-router";
 import type { SaveSchema, UserStateSchema } from "@/__generated__";
+import { useUserLocalStorage } from "@/composables/useUserLocalStorage";
 import romApi from "@/services/api/rom";
 import streamingApi, {
   type ContainerBusyDetail,
@@ -49,9 +51,10 @@ import streamingApi, {
   type LaunchReady,
   type MemoryCardImport,
   type MemoryCardImportDetail,
+  type StreamStatePicks,
+  type StreamingContainer,
 } from "@/services/api/streaming";
 import storeAuth from "@/stores/auth";
-import storePlaying from "@/stores/playing";
 import storeRoms, { type DetailedRom, type SimpleRom } from "@/stores/roms";
 import {
   type SessionStatus,
@@ -74,6 +77,7 @@ import { useBackgroundArt } from "@/v2/composables/useBackgroundArt";
 import { useCoverArt } from "@/v2/composables/useCoverArt";
 import { useFullscreenPref } from "@/v2/composables/useFullscreenPref";
 import { useInputModality } from "@/v2/composables/useInputModality";
+import { useIsAlive } from "@/v2/composables/useIsAlive";
 import { useMultiplayerPref } from "@/v2/composables/useMultiplayerPref";
 import { usePageTitle } from "@/v2/composables/usePageTitle";
 import { usePlayFocus } from "@/v2/composables/usePlayFocus";
@@ -82,7 +86,10 @@ import { usePlayerNav } from "@/v2/composables/usePlayerNav";
 import { romIdFromRoute } from "@/v2/composables/useRouteRom";
 import { useSnackbar } from "@/v2/composables/useSnackbar";
 import { useSocketEvent } from "@/v2/composables/useSocketEvent";
-import { useStageActive } from "@/v2/composables/useStageActive";
+import {
+  usePlayingWhile,
+  useStageActive,
+} from "@/v2/composables/useStageActive";
 import { useUnloadGuard } from "@/v2/composables/useUnloadGuard";
 import type { SliderBtnGroupItem } from "@/v2/lib/primitives/RSliderBtnGroup/types";
 import storeGalleryRoms from "@/v2/stores/galleryRoms";
@@ -97,8 +104,8 @@ const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
 const auth = storeAuth();
-const playingStore = storePlaying();
 const streamingStore = useStreamingStore();
+const alive = useIsAlive();
 const snackbar = useSnackbar();
 const { fullscreenOnPlay } = useFullscreenPref();
 const { multiplayerOnPlay } = useMultiplayerPref();
@@ -160,8 +167,8 @@ const holdsClaim = ref(false);
 const sessionActive = computed(
   () => playerState.value === "playing" || playerState.value === "loading",
 );
+usePlayingWhile(sessionActive);
 watch(sessionActive, (active) => {
-  playingStore.setPlaying(active);
   if (active) startSessionPoll();
   else stopSessionPoll();
 });
@@ -235,14 +242,19 @@ watch(playerState, (state) =>
   setBgArt(state === "playing" ? null : bgCoverUrl.value),
 );
 
-const container = computed(() =>
-  rom.value
-    ? streamingStore.containerForPlatform(rom.value.platform_slug)
-    : null,
+// Pinned at claim, so a permission refresh that turns streaming off mid-game
+// leaves the session its controls until it ends.
+const heldContainer = shallowRef<StreamingContainer | null>(null);
+const container = computed(
+  () =>
+    heldContainer.value ??
+    (rom.value
+      ? streamingStore.containerForPlatform(rom.value.platform_slug)
+      : null),
 );
 
 const capabilities = computed(() =>
-  streamingStore.platformCapabilities(rom.value?.platform_slug),
+  streamingStore.containerCapabilities(container.value),
 );
 
 // Emulators that keep saves in the emulated filesystem rather than in
@@ -301,13 +313,13 @@ const showManualDiscHint = computed(
 // all_user_states carries), newest-first from the backend.
 const selectedState = ref<UserStateSchema | null>(null);
 
-// Every save, whichever emulator wrote it, newest capture first: created_at,
-// since the updated_at user_saves arrives on moves with a rehash.
+// Every save, whichever emulator wrote it, newest write first: updated_at,
+// since the web player writes into its existing row.
 const allSaves = computed<SaveSchema[]>(() => {
   if (!rom.value) return [];
   return [...(rom.value.user_saves ?? [])].sort(
     (a, b) =>
-      new Date(b.created_at).getTime() - new Date(a.created_at).getTime() ||
+      new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime() ||
       b.id - a.id,
   );
 });
@@ -317,7 +329,9 @@ const nativeRestorableSaves = computed<SaveSchema[]>(() => {
   const emulator = emulatorKey(container.value?.emulator);
   if (!emulator) return [];
   return allSaves.value.filter(
-    (s) => emulatorKey(s.emulator) === emulator && s.file_name.endsWith(".zip"),
+    (s) =>
+      emulatorKey(s.emulator) === emulator &&
+      s.file_name.toLowerCase().endsWith(".zip"),
   );
 });
 
@@ -328,11 +342,26 @@ const pickableSaves = computed<SaveSchema[]>(() =>
     : nativeRestorableSaves.value,
 );
 
-// The one the broker restores before boot when the claim names none: this
-// emulator's own, so the fallback restore always succeeds.
-const newestSave = computed<SaveSchema | null>(
-  () => nativeRestorableSaves.value[0] ?? null,
-);
+// The one the claim restores when it names none: this emulator's own newest,
+// unless RetroArch can import a newer bare .srm, as the backend picks too.
+const newestSave = computed<SaveSchema | null>(() => {
+  // A row whose file vanished can't boot, however recently sync touched it.
+  const native =
+    nativeRestorableSaves.value.find((s) => !s.missing_from_fs) ?? null;
+  if (
+    emulatorKey(container.value?.emulator) !== "retroarch" ||
+    !container.value?.import_kinds.includes("save")
+  )
+    return native;
+  // allSaves is newest first, so the first match is the newer of the two.
+  return (
+    allSaves.value.find(
+      (s) =>
+        s === native ||
+        (!s.missing_from_fs && s.file_name.toLowerCase().endsWith(".srm")),
+    ) ?? null
+  );
+});
 
 // A pick only lands where the broker empties the save tree first; elsewhere
 // the container's newer files survive the restore and the pick does nothing.
@@ -352,34 +381,51 @@ const selectedSave = computed<SaveSchema | null>(
     newestSave.value,
 );
 
-// A RetroArch state only loads in the core that wrote it. One stored before
-// cores were recorded has none, and was written by the platform's default.
-function coreMatches(state: UserStateSchema): boolean {
-  const core = container.value?.state_core;
-  if (!core) return true;
-  return state.core === core.expected || (!state.core && core.default_matches);
+// The backend picks the offered states by the claim's rules: native ones resume
+// as they are, the rest only through an import the broker declares.
+const statePicks = ref<StreamStatePicks | null>(null);
+// The rom whose picks have answered, which Play waits for.
+const statePicksRomId = ref<number | null>(null);
+let statePicksRequest = 0;
+// Keyed on what changes the answer, a rename included, so a config or rom
+// refresh that changes nothing asks nothing.
+const statePicksKey = computed(() => {
+  const current = container.value;
+  if (!rom.value || !current) return null;
+  const ids = (rom.value.all_user_states ?? [])
+    .map((s) => `${s.id}:${s.file_name}`)
+    .join(",");
+  const kinds = current.import_kinds.join(",");
+  return `${rom.value.id}|${current.emulator}|${kinds}|${ids}`;
+});
+watch(
+  statePicksKey,
+  async (key) => {
+    const romId = rom.value?.id;
+    if (key === null || romId === undefined || isJoining) return;
+    const request = ++statePicksRequest;
+    let picks: StreamStatePicks | null = null;
+    try {
+      ({ data: picks } = await streamingApi.fetchStatePicks(romId));
+    } catch {
+      // A failed refresh keeps the last answer, so the user's pick survives;
+      // with none yet, nothing is offered and Play boots fresh.
+    }
+    if (!alive.value || request !== statePicksRequest) return;
+    if (picks) statePicks.value = picks;
+    statePicksRomId.value = romId;
+  },
+  { immediate: true },
+);
+
+// In the order all_user_states carries them, newest first.
+function statesById(ids: number[] | undefined): UserStateSchema[] {
+  const wanted = new Set(ids);
+  return (rom.value?.all_user_states ?? []).filter((s) => wanted.has(s.id));
 }
 
-const nativeStreamStates = computed<UserStateSchema[]>(() => {
-  const emulator = emulatorKey(container.value?.emulator);
-  if (!rom.value || !emulator) return [];
-  return (rom.value.all_user_states ?? []).filter(
-    (s) => emulatorKey(s.emulator) === emulator && coreMatches(s),
-  );
-});
-
-// Every state regardless of which emulator wrote it where the broker declares
-// it can import one, which routes a foreign pick through the import path. This
-// emulator's own states still have to match the core, which the import refuses.
-const pickableStates = computed<UserStateSchema[]>(() => {
-  if (!rom.value) return [];
-  if (!container.value?.import_kinds.includes("state"))
-    return nativeStreamStates.value;
-  const emulator = emulatorKey(container.value?.emulator);
-  return (rom.value.all_user_states ?? []).filter(
-    (s) => emulatorKey(s.emulator) !== emulator || coreMatches(s),
-  );
-});
+const nativeStreamStates = computed(() => statesById(statePicks.value?.native));
+const pickableStates = computed(() => statesById(statePicks.value?.pickable));
 
 // Every capture is kept, so a heavy save-stater ends up with a history the
 // horizontal strip buries. Grid and list trade thumbnail size for how many
@@ -390,7 +436,7 @@ const STATE_LAYOUTS = [
   { value: "list", icon: "mdi-view-list" },
 ] as const satisfies readonly { value: AssetLayout; icon: string }[];
 
-const stateLayout = useLocalStorage<AssetLayout>(
+const stateLayout = useUserLocalStorage<AssetLayout>(
   "romm:v2:stream:states-layout",
   "strip",
 );
@@ -408,7 +454,7 @@ watch(
     }
     if (!statePreselected.value && native.length > 0) {
       statePreselected.value = true;
-      if (!selectedState.value) selectedState.value = native[0];
+      if (!selectedState.value) selectedState.value = native[0]!;
     }
   },
   { immediate: true },
@@ -433,8 +479,13 @@ type ResumeTab = "state" | "save";
 
 const resumeTab = ref<ResumeTab>("state");
 
+// The app-load config can predate the broker's import answer, so the picker
+// waits for the page's own refetch.
+const configFresh = ref(false);
+
 const showResumeTabs = computed(
-  () => supportsStates.value && pickableSaves.value.length > 0,
+  () =>
+    configFresh.value && supportsStates.value && pickableSaves.value.length > 0,
 );
 
 // The pick only counts when there is something to pick between.
@@ -496,8 +547,16 @@ const emulatorLabel = computed(
   () => container.value?.label ?? platformLabel.value,
 );
 
+// Held with the resume picker and its picks, so Play never sends a pick the
+// player can't see or skips the state about to be preselected.
 const playReady = computed(
-  () => !!rom.value && playerState.value !== "loading",
+  () =>
+    !!rom.value &&
+    configFresh.value &&
+    playerState.value !== "loading" &&
+    (isJoining ||
+      statePicksKey.value === null ||
+      statePicksRomId.value === rom.value.id),
 );
 usePlayFocus(".r-v2-stream__play", playReady, gameRunning);
 
@@ -672,9 +731,13 @@ async function pollSessionStatus(): Promise<void> {
   }
 }
 
-const sessionPoll = useIntervalFn(pollSessionStatus, SESSION_POLL_MS, {
-  immediate: false,
-});
+const sessionPoll = useIntervalFn(
+  () => void pollSessionStatus(),
+  SESSION_POLL_MS,
+  {
+    immediate: false,
+  },
+);
 
 function startSessionPoll() {
   // The status route belongs to the claim holder; a joiner would only
@@ -698,6 +761,7 @@ const claimedAt = ref<string | null>(null);
 
 function forgetClaim(): void {
   holdsClaim.value = false;
+  heldContainer.value = null;
   claimedContainer.value = null;
   claimedAt.value = null;
 }
@@ -731,7 +795,7 @@ useSocketEvent<LaunchPhase>("streaming:launch-phase", (payload) => {
   launchPhase.value = payload.phase ?? null;
 });
 
-useSocketEvent<LaunchReady>("streaming:launch-ready", async (payload) => {
+async function onLaunchReady(payload: LaunchReady): Promise<void> {
   if (!isOurClaim(payload)) return;
   launchPhase.value = null;
   if (playerState.value === "exited") {
@@ -744,7 +808,12 @@ useSocketEvent<LaunchReady>("streaming:launch-ready", async (payload) => {
   if (playerState.value === "playing") return;
   warnOfCore(payload.core, payload.core_tier);
   await enterStream(payload.host);
-});
+}
+
+useSocketEvent<LaunchReady>(
+  "streaming:launch-ready",
+  (payload) => void onLaunchReady(payload),
+);
 
 useSocketEvent<LaunchFailed>("streaming:launch-failed", (payload) => {
   if (!isOurClaim(payload)) return;
@@ -784,12 +853,18 @@ async function onVisibilityChange(): Promise<void> {
   await pollSessionStatus();
 }
 
+// The backend records the claim holder's session on release, so only a
+// joiner's playtime is timed here.
 watch(gameRunning, (running, prev) => {
   if (running && !prev) {
     presence.start();
-    nextTick(focusStream);
+    if (rom.value && isJoining) playSession.start(rom.value);
+    void nextTick(focusStream);
   }
-  if (prev && !running) presence.stop();
+  if (prev && !running) {
+    presence.stop();
+    playSession.flush();
+  }
 });
 
 // ── Stage ──────────────────────────────────────────────────────────
@@ -806,26 +881,19 @@ function focusStream(): void {
 // viewer's own output rather than the mixer every viewer shares. The broker
 // path is what is left for cross-origin containers, and it stays debounced so
 // the broker only hears the value once it settles.
-let volumeDebounce: ReturnType<typeof setTimeout> | null = null;
-
-function sendVolumeToBroker(level: number): void {
-  if (volumeDebounce) clearTimeout(volumeDebounce);
-  volumeDebounce = setTimeout(() => {
-    const platform = rom.value?.platform_slug;
-    if (platform)
-      streamingApi
-        .setVolume(platform, level, claimedContainer.value, claimedAt.value)
-        .catch((err) =>
-          console.error("[streaming] Could not set volume:", err),
-        );
-  }, 150);
-}
+const sendVolumeToBroker = useDebounceFn((level: number) => {
+  const platform = rom.value?.platform_slug;
+  if (platform)
+    streamingApi
+      .setVolume(platform, level, claimedContainer.value, claimedAt.value)
+      .catch((err) => console.error("[streaming] Could not set volume:", err));
+}, 150);
 
 watch(volume, (val) => {
   const level = Math.round(val);
   if (stage.value?.postToStream({ type: "setVolume", value: level / 100 }))
     return;
-  sendVolumeToBroker(level);
+  void sendVolumeToBroker(level);
 });
 
 function toggleMute(): void {
@@ -910,10 +978,10 @@ async function onPlay(cardImport?: MemoryCardImport): Promise<void> {
       const launching = await streamingStore.claimSession(
         rom.value.id,
         selectedState.value?.id,
-        // Left off where the container would refuse it, so the backend
-        // restores the newest archive instead.
-        showSavePicker.value
-          ? (selectedSave.value?.id ?? undefined)
+        // Only a pick the player made. Left off, the backend boots its own
+        // default and can fall back to the archive if an import is refused.
+        showSavePicker.value && selectedSave.value?.id === savePickId.value
+          ? (savePickId.value ?? undefined)
           : undefined,
         container.value?.supports_memory_cards
           ? (selectedMemoryCardId.value ?? undefined)
@@ -922,6 +990,7 @@ async function onPlay(cardImport?: MemoryCardImport): Promise<void> {
         multiplayerOnPlay.value,
       );
       claimedContainer.value = launching.container;
+      heldContainer.value = container.value;
       claimedAt.value = launching.claimed_at;
       holdsClaim.value = true;
       // Every exit path ran before there was a claim to hand back.
@@ -1015,13 +1084,6 @@ async function onPlay(cardImport?: MemoryCardImport): Promise<void> {
           ? detail
           : hintForStatus(status);
     }
-  }
-
-  // Start timing the session once the claim succeeds and playback is live.
-  // The session is ingested on unmount, which updates last_played /
-  // now_playing / status server-side.
-  if (rom.value && (playerState.value as PlayerState) === "playing") {
-    playSession.start(rom.value);
   }
 }
 
@@ -1211,7 +1273,7 @@ const { romRoute, platformRoute } = usePlayerNav(
   () => heroRom.value?.platform_id,
 );
 function backToRom() {
-  router.push(romRoute);
+  void router.push(romRoute);
 }
 
 // ── Exit guard (big-picture safety) ────────────────────────────────
@@ -1234,13 +1296,13 @@ async function openExitDialog(): Promise<void> {
 watch(exitDialogOpen, (open) => {
   if (!open) {
     pendingLeave = null;
-    if (gameRunning.value) nextTick(focusStream);
+    if (gameRunning.value) void nextTick(focusStream);
   }
 });
 
 onBeforeRouteLeave((to) => {
   if (!sessionActive.value) return true;
-  pendingLeave = () => router.push(to.fullPath);
+  pendingLeave = () => void router.push(to.fullPath);
   void openExitDialog();
   return false;
 });
@@ -1265,69 +1327,9 @@ async function exitWithoutSaving(): Promise<void> {
   (leave ?? backToRom)();
 }
 
-// Dialogs have no automatic spatial navigation, so cycle focus between
-// the action buttons on arrow keys (the d-pad arrives as synthetic
-// ArrowLeft/ArrowRight keydowns from useGamepad).
-function onExitDialogKeydown(event: KeyboardEvent): void {
-  const arrows = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
-  if (!arrows.includes(event.key)) return;
-  const root = event.currentTarget as HTMLElement;
-  const buttons = Array.from(
-    root.querySelectorAll<HTMLElement>("button:not([disabled])"),
-  );
-  if (buttons.length === 0) return;
-  const idx = buttons.indexOf(document.activeElement as HTMLElement);
-  const step = event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : -1;
-  buttons[(idx + step + buttons.length) % buttons.length]?.focus();
-  event.preventDefault();
-}
-
-// ── Select+Start exit chord ────────────────────────────────────────
-// useGamepad is muted for the whole session (launch included), so the
-// chord is read straight from the Gamepad API here; polling while
-// "loading" keeps the cancel dialog reachable by pad if a launch hangs.
-// The 1.5s hold filters out anything a game itself binds to Select+Start.
-// Only standard-mapped pads participate: elsewhere indices 8/9 are not
-// guaranteed to be Select+Start.
-const EXIT_CHORD_HOLD_MS = 1500;
-// A 1.5s hold needs nowhere near frame resolution, and this runs on the thread
-// compositing the stream for as long as the session lasts.
-const EXIT_CHORD_POLL_MS = 100;
-let chordHeldSince = 0;
-
-function pollExitChord(): void {
-  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
-  const held = Array.from(pads).some(
-    (pad) =>
-      pad &&
-      pad.mapping === "standard" &&
-      pad.buttons[8]?.pressed &&
-      pad.buttons[9]?.pressed,
-  );
-  const now = performance.now();
-  if (!held) {
-    chordHeldSince = 0;
-  } else if (!chordHeldSince) {
-    chordHeldSince = now;
-  } else if (now - chordHeldSince >= EXIT_CHORD_HOLD_MS) {
-    chordHeldSince = 0;
-    if (!exitDialogOpen.value) void openExitDialog();
-  }
-}
-
-const exitChordPoll = useIntervalFn(pollExitChord, EXIT_CHORD_POLL_MS, {
-  immediate: false,
-});
-
-function stopExitChordPoll(): void {
-  exitChordPoll.pause();
-  chordHeldSince = 0;
-}
-
-watch(sessionActive, (active) => {
-  if (active) exitChordPoll.resume();
-  else stopExitChordPoll();
-});
+// useGamepad is muted for the whole session (launch included), so its
+// Select+Start hold is the pad's only way to the exit dialog.
+useEventListener(window, "gamepad:exitchord", () => void openExitDialog());
 
 function formatTime(iso: string): string {
   try {
@@ -1373,10 +1375,15 @@ function onPageHide(): void {
   playerState.value = "exited";
 }
 
-useEventListener(document, "visibilitychange", onVisibilityChange);
+useEventListener(document, "visibilitychange", () => void onVisibilityChange());
 useEventListener(window, "pagehide", onPageHide);
 
 onMounted(async () => {
+  // The app-load copy can predate a broker that hadn't answered yet, and what
+  // it imports decides which saves the picker offers, so ask again here.
+  const freshConfig = streamingStore.fetchConfig().finally(() => {
+    if (alive.value) configFresh.value = true;
+  });
   try {
     const { data } = await romApi.getRom({
       romId: parseInt(route.params.rom as string),
@@ -1395,7 +1402,7 @@ onMounted(async () => {
   if (isJoining) {
     // Reaching this URL directly can beat the app-level config fetch, and
     // onPlay reads the container out of it.
-    if (!container.value) await streamingStore.fetchConfig();
+    if (!container.value) await freshConfig;
     void onPlay();
     return;
   }
@@ -1405,8 +1412,7 @@ onBeforeUnmount(() => {
   // Every exit path (Stop, Save & Exit, back nav) unmounts the view, so this
   // is the single choke point for recording the session.
   playSession.flush();
-  playingStore.setPlaying(false);
-  if (volumeDebounce) clearTimeout(volumeDebounce);
+  sendVolumeToBroker.cancel();
   // The polls clear themselves with the scope; the presence board does not
   // know the player has gone until it is told.
   presence.emitStop();
@@ -1470,9 +1476,10 @@ onBeforeUnmount(() => {
           variant="flat"
           color="primary"
           block
-          :prepend-icon="playerState === 'loading' ? 'mdi-loading' : 'mdi-play'"
+          :prepend-icon="
+            playerState === 'loading' ? 'mdi-loading mdi-spin' : 'mdi-play'
+          "
           class="r-v2-stream__play"
-          :class="{ 'r-v2-stream__play--launching': playerState === 'loading' }"
           :disabled="!playReady"
           @click="onPlay()"
         >
@@ -1533,7 +1540,11 @@ onBeforeUnmount(() => {
           </template>
         </div>
         <div class="r-v2-stream__resume-body">
-          <template v-if="activeResumeTab === 'state'">
+          <div v-if="!configFresh" class="r-v2-stream__resume-loading">
+            <RSpinner :size="24" :aria-label="t('common.loading')" />
+          </div>
+
+          <template v-else-if="activeResumeTab === 'state'">
             <AssetPreview
               :asset="selectedState"
               type="state"
@@ -1556,10 +1567,7 @@ onBeforeUnmount(() => {
                   variant="text"
                   size="x-small"
                   :icon="view.icon"
-                  :aria-pressed="stateLayout === view.value"
-                  :class="{
-                    'r-v2-stream__strip-view--on': stateLayout === view.value,
-                  }"
+                  :active="stateLayout === view.value"
                   :aria-label="t(`play.states-view-${view.value}`)"
                   @click="stateLayout = view.value"
                 />
@@ -1581,7 +1589,6 @@ onBeforeUnmount(() => {
               type="save"
               :show-heading="false"
               :clearable="false"
-              timestamp="created"
             />
             <div class="r-v2-stream__strip-label">
               <span aria-hidden="true">{{ t("play.all-saves") }}</span>
@@ -1593,7 +1600,6 @@ onBeforeUnmount(() => {
               :assets="pickableSaves"
               type="save"
               :selected-id="selectedSave?.id ?? null"
-              timestamp="created"
               :group-by-slot="false"
               @select="savePickId = ($event as SaveSchema).id"
             />
@@ -1880,7 +1886,7 @@ onBeforeUnmount(() => {
       </template>
       <template #footer>
         <!-- eslint-disable-next-line vuejs-accessibility/no-static-element-interactions -- arrow keys rove focus between this container's real buttons, which stay the interactive elements; the listener sits here to catch keydowns bubbling from either of them -->
-        <div class="r-v2-stream__exit-actions" @keydown="onExitDialogKeydown">
+        <div class="r-v2-stream__exit-actions">
           <!-- eslint-disable vuejs-accessibility/no-autofocus -- RDialog reads [autofocus] to place initial focus, and the least destructive action is the intended target -->
           <RBtn
             autofocus
@@ -2092,14 +2098,6 @@ onBeforeUnmount(() => {
   box-shadow: 0 10px 24px
     color-mix(in srgb, var(--r-color-brand-primary) 35%, transparent);
 }
-.r-v2-stream__play--launching :deep(.v-icon) {
-  animation: r-v2-stream-spin 0.8s linear infinite;
-}
-@keyframes r-v2-stream-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
 .r-v2-stream__hero-links {
   display: flex;
   flex-direction: column;
@@ -2129,6 +2127,12 @@ onBeforeUnmount(() => {
   gap: 14px;
   flex: 1;
 }
+.r-v2-stream__resume-loading {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+}
 .r-v2-stream__strip-label {
   display: flex;
   align-items: center;
@@ -2145,9 +2149,6 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 2px;
-}
-.r-v2-stream__strip-view--on {
-  color: var(--r-color-brand-primary);
 }
 .r-v2-stream__strip-count {
   display: inline-grid;

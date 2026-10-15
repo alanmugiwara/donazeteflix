@@ -1,10 +1,11 @@
+import asyncio
 import hashlib
 import os
 import threading
 import zipfile
 from mimetypes import guess_type
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
 import magic
 from fastapi import HTTPException, UploadFile, status
@@ -61,17 +62,31 @@ def hash_zip_contents(zf: zipfile.ZipFile) -> str:
     return hashlib.md5(combined.encode(), usedforsecurity=False).hexdigest()
 
 
+def hash_save_content(content: IO[bytes]) -> str | None:
+    """Hash seekable save bytes like ``Save.content_hash``, leaving them at the start."""
+    try:
+        content.seek(0)
+        if zipfile.is_zipfile(content):
+            with zipfile.ZipFile(content, "r") as zf:
+                return hash_zip_contents(zf)
+        content.seek(0)
+        hash_obj = hashlib.md5(usedforsecurity=False)
+        while chunk := content.read(65536):
+            hash_obj.update(chunk)
+        return hash_obj.hexdigest()
+    except Exception as e:
+        log.debug(f"Could not hash save content: {e}")
+        return None
+    finally:
+        content.seek(0)
+
+
 def hash_save_file(path: str | os.PathLike[str]) -> str | None:
     """Hash a save on disk like ``Save.content_hash``, or None if it cannot be read."""
     try:
-        if zipfile.is_zipfile(path):
-            with zipfile.ZipFile(path, "r") as zf:
-                return hash_zip_contents(zf)
         with open(path, "rb") as f:
-            return hashlib.file_digest(
-                f, lambda: hashlib.md5(usedforsecurity=False)
-            ).hexdigest()
-    except Exception as e:
+            return hash_save_content(f)
+    except OSError as e:
         log.debug(f"Could not hash save {path}: {e}")
         return None
 
@@ -210,8 +225,12 @@ class FSAssetsHandler(FSHandler):
         )
 
     async def _compute_zip_hash(self, zip_path: str) -> str:
-        with zipfile.ZipFile(self.base_path / zip_path, "r") as zf:
-            return hash_zip_contents(zf)
+        def digest() -> str:
+            with zipfile.ZipFile(self.base_path / zip_path, "r") as zf:
+                return hash_zip_contents(zf)
+
+        # Off the loop, as _compute_file_hash is: a state archive runs to tens of MB.
+        return await asyncio.to_thread(digest)
 
     async def compute_content_hash(self, file_path: str) -> str | None:
         try:

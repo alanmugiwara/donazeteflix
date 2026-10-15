@@ -5,7 +5,7 @@
 // `<img>` mount. In tables and menus that render many platform icons,
 // this turns into a flood of network requests every time the surface
 // opens. Caching the raw blob and reusing a `URL.createObjectURL()`
-// URL means subsequent reads are memory-local — zero network for the
+// URL means subsequent reads are memory-local: zero network for the
 // lifetime of the page.
 //
 // The cache is a `reactive(Map)` so components reading via
@@ -80,9 +80,10 @@ export function prefetchPlatformIcons(slugs: readonly string[]): void {
   const run = () => {
     for (const slug of slugs) if (slug) void fetchOne(slug);
   };
-  const ric = (
-    window as Window & { requestIdleCallback?: (cb: () => void) => number }
-  ).requestIdleCallback;
-  if (typeof ric === "function") ric(run);
+  const win = window as Window & {
+    requestIdleCallback?: (cb: () => void) => number;
+  };
+  if (typeof win.requestIdleCallback === "function")
+    win.requestIdleCallback(run);
   else setTimeout(run, 0);
 }

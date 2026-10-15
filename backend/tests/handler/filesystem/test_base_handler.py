@@ -1,6 +1,7 @@
 import asyncio
 import errno
 import os
+import re
 import shutil
 import tempfile
 from io import BytesIO
@@ -21,7 +22,6 @@ from handler.filesystem.base_handler import (
     region_ranks_for_priority,
     translation_language,
 )
-from models.base import FILE_NAME_MAX_LENGTH
 
 
 class TestFSHandler:
@@ -52,15 +52,15 @@ class TestFSHandler:
         mock_file.file = BytesIO(sample_file_content)
         return mock_file
 
-    def test_init_creates_base_directory(self, temp_dir):
-        """Test that FSHandler creates base directory on initialization"""
-        # Remove the directory to test creation
+    async def test_base_directory_is_created_on_first_write(self, temp_dir):
         shutil.rmtree(temp_dir)
 
         handler = FSHandler(temp_dir)
+        assert not handler.base_path.exists()
 
-        assert handler.base_path.exists()
-        assert handler.base_path.is_dir()
+        await handler.write_file(b"data", path="", filename="test.txt")
+
+        assert (handler.base_path / "test.txt").read_bytes() == b"data"
 
     def test_init_resolves_path(self, temp_dir):
         """Test that FSHandler resolves the base path"""
@@ -81,6 +81,15 @@ class TestFSHandler:
         assert handler._sanitize_filename("/etc/passwd") == "passwd"
         assert handler._sanitize_filename("dir/../test.txt") == "test.txt"
 
+    def test_sanitize_filename_over_255_bytes(self, handler: FSHandler):
+        """The filesystem caps a name at 255 bytes, well under the column's
+        450 characters, so a multibyte name hits it first."""
+        assert handler._sanitize_filename("あ" * 85) == "あ" * 85
+        with pytest.raises(ValueError, match="255 bytes"):
+            handler._sanitize_filename("あ" * 86)
+        with pytest.raises(ValueError, match="255 bytes"):
+            handler._sanitize_filename("a" * 256)
+
     def test_sanitize_filename_invalid(self, handler: FSHandler):
         """Test filename sanitization with invalid filenames"""
         with pytest.raises(ValueError, match="Empty filename"):
@@ -91,12 +100,6 @@ class TestFSHandler:
 
         with pytest.raises(ValueError, match="Invalid filename"):
             handler._sanitize_filename("..")
-
-    def test_sanitize_filename_too_long(self, handler: FSHandler):
-        """Test filename sanitization with too long filenames"""
-        long_name = "a" * (FILE_NAME_MAX_LENGTH + 1)
-        with pytest.raises(ValueError, match="Filename .* exceeds maximum length"):
-            handler._sanitize_filename(long_name)
 
     def test_validate_path_valid(self, handler: FSHandler):
         """Test path validation with valid paths"""
@@ -151,6 +154,47 @@ class TestFSHandler:
                 ValueError, match="Path .* must be relative, not absolute"
             ):
                 handler.validate_path(path)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "",
+            ".",
+            "test.txt",
+            "dir/test.txt",
+            "dir//sub/./test.txt",
+            "dir/",
+            "linked/test.txt",
+            "dir/../test.txt",
+            "../test.txt",
+            "/etc/passwd",
+        ],
+    )
+    def test_cached_path_validator_matches_validate_path(
+        self, handler: FSHandler, temp_dir: str, tmp_path: Path, path: str
+    ):
+        (Path(temp_dir) / "dir").mkdir()
+        (Path(temp_dir) / "linked").symlink_to(tmp_path, target_is_directory=True)
+        validate = handler.cached_path_validator()
+
+        try:
+            expected = handler.validate_path(path)
+        except ValueError as exc:
+            with pytest.raises(ValueError, match=re.escape(str(exc))):
+                validate(path)
+        else:
+            assert validate(path) == expected
+
+    def test_cached_path_validator_checks_each_directory_once(self, handler: FSHandler):
+        validate = handler.cached_path_validator()
+
+        with patch.object(
+            handler, "validate_path", wraps=handler.validate_path
+        ) as validate_path:
+            paths = [validate(f"dir/{name}.png") for name in ("a", "b", "c")]
+
+        validate_path.assert_called_once_with("dir")
+        assert paths == [handler.base_path / "dir" / f"{n}.png" for n in "abc"]
 
     def test_get_file_name_with_no_extension(self, handler: FSHandler):
         """Test file name extraction without extension"""
@@ -726,15 +770,14 @@ class TestFSHandler:
 
 
 class TestFSHandlerInit:
-    def test_raises_on_mkdir_failure(self):
-        """OSError from mkdir propagates, so misconfigured paths fail loudly
-        at construction time. Optional features should defer construction
-        (e.g. via a lazy factory) rather than swallow the error."""
+    def test_does_not_touch_an_unwritable_base_path(self):
+        """Handlers are built at import, so an unmounted base path can't block boot."""
         with patch.object(
             Path, "mkdir", side_effect=PermissionError(errno.EACCES, "denied")
-        ):
-            with pytest.raises(PermissionError):
-                FSHandler("/some/unwritable/path")
+        ) as mkdir:
+            FSHandler("/some/unwritable/path")
+
+        mkdir.assert_not_called()
 
 
 class TestRegionRanksForPriority:

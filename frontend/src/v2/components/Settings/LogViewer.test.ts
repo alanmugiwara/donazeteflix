@@ -1,5 +1,4 @@
 import { flushPromises, mount } from "@vue/test-utils";
-import { createPinia, setActivePinia } from "pinia";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { defineComponent } from "vue";
 import i18n, { loadLocale } from "@/locales";
@@ -9,12 +8,14 @@ const { copy } = vi.hoisted(() => ({ copy: vi.fn() }));
 
 vi.mock("@/services/api", () => ({
   default: {
-    get: vi.fn(async () => ({
-      data: [
-        { ts: 0, level: "INFO", module: "scan", message: "first" },
-        { ts: 1000, level: "ERROR", module: "rq", message: "second" },
-      ],
-    })),
+    get: vi.fn(() =>
+      Promise.resolve({
+        data: [
+          { ts: 0, level: "INFO", module: "scan", message: "first" },
+          { ts: 1000, level: "ERROR", module: "rq", message: "second" },
+        ],
+      }),
+    ),
   },
 }));
 vi.mock("@/v2/composables/useSocketEvent", () => ({
@@ -43,7 +44,6 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
-  setActivePinia(createPinia());
   copy.mockReset();
   copy.mockResolvedValue(true);
 });
@@ -55,7 +55,7 @@ describe("LogViewer", () => {
     await wrapper.find('[aria-label="Copy to clipboard"]').trigger("click");
 
     expect(copy).toHaveBeenCalledTimes(1);
-    const [text, opts] = copy.mock.calls[0];
+    const [text, opts] = copy.mock.calls[0]!;
     expect(text.split("\n")).toEqual([
       "[1970-01-01T00:00:00.000Z] INFO [scan] first",
       "[1970-01-01T00:00:01.000Z] ERROR [rq] second",

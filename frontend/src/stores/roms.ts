@@ -1,4 +1,3 @@
-import { useLocalStorage } from "@vueuse/core";
 import { isNull, isUndefined } from "lodash";
 import { defineStore } from "pinia";
 import type {
@@ -7,6 +6,10 @@ import type {
   SearchRomSchema,
 } from "@/__generated__/";
 import type { CustomLimitOffsetPage_SimpleRomSchema_ as GetRomsResponse } from "@/__generated__/models/CustomLimitOffsetPage_SimpleRomSchema_";
+import {
+  userStorage,
+  useUserLocalStorage,
+} from "@/composables/useUserLocalStorage";
 import cachedApiService from "@/services/cache/api";
 import {
   type Collection,
@@ -17,6 +20,7 @@ import storeGalleryFilter from "@/stores/galleryFilter";
 import storePlatforms from "@/stores/platforms";
 import { type Platform } from "@/stores/platforms";
 import type { ExtractPiniaStoreType } from "@/types";
+import { toError } from "@/utils/toError";
 
 type GalleryFilterStore = ExtractPiniaStoreType<typeof storeGalleryFilter>;
 type PlatformsStore = ExtractPiniaStoreType<typeof storePlatforms>;
@@ -29,8 +33,8 @@ export type DetailedRom = DetailedRomSchema;
 // the player view that picks up the details page's record.
 export const DETAILED_ROM_CACHE_SIZE = 3;
 
-const orderByStorage = useLocalStorage<string>("roms.orderBy", "");
-const orderDirStorage = useLocalStorage("roms.orderDir", "asc");
+const orderByStorage = useUserLocalStorage<string>("roms.orderBy", "");
+const orderDirStorage = useUserLocalStorage("roms.orderDir", "asc");
 
 // NOTE on deprecation: the gallery-list responsibility (currentPlatform /
 // Collection / Virtual / Smart, _allRoms, fetchOffset, fetchTotalRoms,
@@ -106,9 +110,9 @@ export default defineStore("roms", {
 
   actions: {
     _shouldGroupRoms(): boolean {
-      return isNull(localStorage.getItem("settings.groupRoms"))
+      return isNull(userStorage.getItem("settings.groupRoms"))
         ? true
-        : localStorage.getItem("settings.groupRoms") === "true";
+        : userStorage.getItem("settings.groupRoms") === "true";
     },
     /** @deprecated v2: use `useGalleryRoms().setCurrentPlatform`. */
     setCurrentPlatform(platform: Platform | null) {
@@ -299,7 +303,7 @@ export default defineStore("roms", {
             resolve(response.data.items);
           })
           .catch((error) => {
-            reject(error);
+            reject(toError(error));
           })
           .finally(() => {
             this.fetchingRoms = false;
@@ -329,21 +333,21 @@ export default defineStore("roms", {
     },
     addToRecent(rom: SimpleRom) {
       this.recentRoms = [rom, ...this.recentRoms];
-      cachedApiService.clearRecentRomsCache();
+      void cachedApiService.clearRecentRomsCache();
     },
     removeFromRecent(rom: SimpleRom) {
       this.recentRoms = this.recentRoms.filter((value) => value.id !== rom.id);
-      cachedApiService.clearRecentRomsCache();
+      void cachedApiService.clearRecentRomsCache();
     },
     addToContinuePlaying(rom: SimpleRom) {
       this.continuePlayingRoms = [rom, ...this.continuePlayingRoms];
-      cachedApiService.clearRecentPlayedRomsCache();
+      void cachedApiService.clearRecentPlayedRomsCache();
     },
     removeFromContinuePlaying(rom: SimpleRom) {
       this.continuePlayingRoms = this.continuePlayingRoms.filter(
         (value) => value.id !== rom.id,
       );
-      cachedApiService.clearRecentPlayedRomsCache();
+      void cachedApiService.clearRecentPlayedRomsCache();
     },
     update(rom: SimpleRom) {
       this._allRoms = this._allRoms.map((value) =>

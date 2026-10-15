@@ -1,5 +1,6 @@
 """WebDAV surface for RetroArch Cloud Sync, plus read-only browsing for generic clients."""
 
+import asyncio
 import os
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -10,19 +11,19 @@ from urllib.parse import quote
 from fastapi import APIRouter, Request, Response, UploadFile, status
 from fastapi.responses import JSONResponse, RedirectResponse
 
+from handler.asset_store import remove_save
 from handler.auth.constants import Scope
 from handler.auth.dependencies import get_permissions
 from handler.auth.permissions import ResolvedPermissions
 from handler.database import (
     db_platform_handler,
-    db_save_handler,
     db_screenshot_handler,
     db_state_handler,
 )
 from handler.filesystem import fs_asset_handler, fs_retroarch_sync_handler
 from handler.filesystem.assets_handler import build_asset_file_response
 from handler.filesystem.base_handler import FSHandler
-from handler.scan_handler import scan_save, scan_screenshot, scan_state
+from handler.scan_handler import scan_screenshot, scan_state
 from handler.sync.retroarch import browser, psp, sync_handler
 from handler.sync.retroarch.device import touch_retroarch_device
 from handler.sync.retroarch.sync_handler import (
@@ -36,7 +37,7 @@ from logger.logger import log
 from models.assets import Save, Screenshot, State
 from models.rom import Rom
 from models.user import User
-from utils.filesystem import sanitize_filename
+from utils.filesystem import check_filename_length, sanitize_filename
 
 router = APIRouter(prefix="/retroarch")
 
@@ -121,16 +122,24 @@ def _can_read_roms(request: Request) -> bool:
 
 
 def _rom_visibility(request: Request) -> Callable[[Rom], bool]:
-    permissions = get_permissions(request)
-    return lambda rom: permissions.can_see_rom(rom.id, rom.platform_id)
+    # Permissions are resolved on first use, which every caller makes in a thread.
+    return lambda rom: get_permissions(request).can_see_rom(rom)
 
 
-def _resolve_rom(request: Request, kind: AssetKind, file_name: str) -> Rom | None:
+async def _resolve_rom(request: Request, kind: AssetKind, file_name: str) -> Rom | None:
     game_name = sync_handler.game_name_from_file_name(kind, file_name)
-    return sync_handler.resolve_rom(game_name, _rom_visibility(request))
+    return await asyncio.to_thread(
+        sync_handler.resolve_rom, game_name, _rom_visibility(request)
+    )
 
 
-def _get_asset(
+async def _get_asset(
+    user: User, rom: Rom, parsed: RetroArchSyncPath
+) -> Save | State | Screenshot | None:
+    return await asyncio.to_thread(_find_asset, user, rom, parsed)
+
+
+def _find_asset(
     user: User, rom: Rom, parsed: RetroArchSyncPath
 ) -> Save | State | Screenshot | None:
     if parsed.is_state_screenshot:
@@ -139,21 +148,19 @@ def _get_asset(
         )
 
     if parsed.kind == "saves":
-        file_path = sync_handler.build_asset_file_path(
-            user, rom, parsed.kind, parsed.emulator
-        )
-        return db_save_handler.get_save_by_path(
-            user_id=user.id,
-            rom_id=rom.id,
-            file_path=file_path,
-            file_name=parsed.file_name,
-        )
+        return sync_handler.resolve_save(user, rom, parsed.emulator, parsed.file_name)
 
     # The requested name is the canonical slot name, which a web-player state's
     # own file name won't match, so the slot is resolved instead.
     return sync_handler.resolve_state_by_slot(
         user, rom, parsed.emulator, parsed.file_name
     )
+
+
+def _find_rom_file(
+    request: Request, slug: str, file_name: str
+) -> browser.RomFile | None:
+    return browser.find_rom_file(slug, file_name, get_permissions(request))
 
 
 def _serve(handler: FSHandler, path: str, filename: str) -> Response:
@@ -229,7 +236,6 @@ async def retroarch_sync_propfind(request: Request, file_path: str) -> Response:
         return denied
 
     depth = 0 if request.headers.get("depth") == "0" else 1
-    permissions = get_permissions(request)
     parts = sync_handler.split_segments(file_path)
     if parts is None:
         return _empty(status.HTTP_404_NOT_FOUND)
@@ -245,17 +251,8 @@ async def retroarch_sync_propfind(request: Request, file_path: str) -> Response:
                 entries.append(_collection_entry("roms"))
             if not request.user.is_kiosk_guest:
                 entries += [_collection_entry("saves"), _collection_entry("states")]
-    elif parts == ["roms"]:
-        entries = [_collection_entry("roms")]
-        if depth != 0:
-            entries += [
-                _collection_entry(f"roms/{p.fs_slug}", p.name)
-                for p in browser.list_platforms(permissions)
-            ]
-    elif len(parts) == 2 and parts[0] == "roms":
-        entries = _platform_listing(parts[1], depth, permissions)
-    elif len(parts) == 3 and parts[0] == "roms":
-        entries = _rom_file_entry(parts[1], parts[2], permissions)
+    elif parts[0] == "roms":
+        entries = await asyncio.to_thread(_roms_listing, request, parts, depth)
     elif parts[0] in ("saves", "states"):
         entries = await _save_state_listing(
             parts, depth, request.user, _rom_visibility(request)
@@ -273,6 +270,25 @@ async def retroarch_sync_propfind(request: Request, file_path: str) -> Response:
         # Some Apple WebDAV clients reportedly fail to parse application/xml.
         media_type="text/xml; charset=utf-8",
     )
+
+
+def _roms_listing(
+    request: Request, parts: list[str], depth: int
+) -> list[browser.PropfindEntry] | None:
+    permissions = get_permissions(request)
+    if len(parts) == 1:
+        entries = [_collection_entry("roms")]
+        if depth != 0:
+            entries += [
+                _collection_entry(f"roms/{p.fs_slug}", p.name)
+                for p in browser.list_platforms(permissions)
+            ]
+        return entries
+    if len(parts) == 2:
+        return _platform_listing(parts[1], depth, permissions)
+    if len(parts) == 3:
+        return _rom_file_entry(parts[1], parts[2], permissions)
+    return None
 
 
 def _collection_entry(
@@ -378,7 +394,7 @@ async def retroarch_sync_get(request: Request, file_path: str) -> Response:
         return denied
 
     if file_path.strip("/") == MANIFEST_FILE_NAME:
-        touch_retroarch_device(request.user)
+        await asyncio.to_thread(touch_retroarch_device, request.user)
         manifest = await sync_handler.build_manifest(
             request.user, _rom_visibility(request)
         )
@@ -406,8 +422,8 @@ async def retroarch_sync_get(request: Request, file_path: str) -> Response:
         if not _can_read_roms(request):
             return _empty(status.HTTP_403_FORBIDDEN)
 
-        file = browser.find_rom_file(
-            rom_parts[1], rom_parts[2], get_permissions(request)
+        file = await asyncio.to_thread(
+            _find_rom_file, request, rom_parts[1], rom_parts[2]
         )
         if not file:
             return _empty(status.HTTP_404_NOT_FOUND)
@@ -423,11 +439,18 @@ async def retroarch_sync_get(request: Request, file_path: str) -> Response:
     if not parsed:
         return _empty(status.HTTP_404_NOT_FOUND)
 
-    rom = _resolve_rom(request, parsed.kind, parsed.file_name)
+    rom = await _resolve_rom(request, parsed.kind, parsed.file_name)
     if not rom:
         return _empty(status.HTTP_404_NOT_FOUND)
 
-    asset = _get_asset(request.user, rom, parsed)
+    asset = await _get_asset(request.user, rom, parsed)
+    # A file deleted outside RomM hides any older asset at this path until flagged.
+    while (
+        asset
+        and not asset.missing_from_fs
+        and await asyncio.to_thread(sync_handler.flag_if_missing, asset)
+    ):
+        asset = await _get_asset(request.user, rom, parsed)
     if not asset:
         return _empty(status.HTTP_404_NOT_FOUND)
 
@@ -496,10 +519,11 @@ async def retroarch_sync_put(request: Request, file_path: str) -> Response:
     try:
         if sanitize_filename(file_name) != file_name:
             return _empty(status.HTTP_409_CONFLICT)
+        check_filename_length(file_name)
     except ValueError:
         return _empty(status.HTTP_409_CONFLICT)
 
-    rom = _resolve_rom(request, parsed.kind, file_name)
+    rom = await _resolve_rom(request, parsed.kind, file_name)
     if not rom:
         log.warning(f"Cloud sync upload {hl(file_path)} matches no ROM in the library")
         return _empty(status.HTTP_409_CONFLICT)
@@ -507,22 +531,26 @@ async def retroarch_sync_put(request: Request, file_path: str) -> Response:
     log.info(f"Cloud sync upload {hl(file_name)} for {hl(str(rom.name), color=BLUE)}")
 
     if parsed.is_state_screenshot:
-        # Written under the owning state's real name, which may differ from the
-        # canonical one, so an existing screenshot is updated rather than forked.
-        owning_state = sync_handler.resolve_state_by_slot(
+        # Written under the owning state's real name and emulator, which may
+        # differ from the canonical ones, so an existing screenshot is updated.
+        screenshot_file_name, screenshot_emulator, served = await asyncio.to_thread(
+            sync_handler.screenshot_upload_target,
             request.user,
             rom,
             parsed.emulator,
-            sync_handler.state_name_of_screenshot(file_name),
+            file_name,
         )
-        screenshot_file_name = (
-            f"{owning_state.file_name}.png" if owning_state else file_name
-        )
+        try:
+            check_filename_length(screenshot_file_name)
+        except ValueError:
+            return _empty(status.HTTP_409_CONFLICT)
 
         screenshot_path = sync_handler.state_screenshot_dir(
-            request.user, rom, parsed.emulator
+            request.user, rom, screenshot_emulator
         )
         async with _request_body(request) as body:
+            if served and await sync_handler.screenshot_sent_back(served, body):
+                return _empty(status.HTTP_204_NO_CONTENT)
             await fs_asset_handler.write_file(
                 file=body, path=screenshot_path, filename=screenshot_file_name
             )
@@ -532,92 +560,132 @@ async def retroarch_sync_put(request: Request, file_path: str) -> Response:
             user=request.user,
             platform_fs_slug=rom.platform.fs_slug,
             rom_id=rom.id,
-            emulator=parsed.emulator,
+            emulator=screenshot_emulator,
         )
-        existing_screenshot = next(
-            (
-                shot
-                for shot in db_screenshot_handler.get_screenshots(
-                    user_id=request.user.id, rom_ids={rom.id}
-                )
-                if shot.file_name == screenshot_file_name
-                and shot.file_path == screenshot_path
-            ),
-            None,
+        created = await asyncio.to_thread(
+            _record_screenshot,
+            request.user,
+            rom,
+            scanned_screenshot,
+            screenshot_file_name,
+            screenshot_path,
         )
-        if existing_screenshot:
-            db_screenshot_handler.update_screenshot(
-                existing_screenshot.id,
-                {
-                    "file_size_bytes": scanned_screenshot.file_size_bytes,
-                    "missing_from_fs": False,
-                },
-            )
-            return _empty(status.HTTP_204_NO_CONTENT)
+        return _empty(
+            status.HTTP_201_CREATED if created else status.HTTP_204_NO_CONTENT
+        )
 
-        scanned_screenshot.rom_id = rom.id
-        scanned_screenshot.user_id = request.user.id
-        db_screenshot_handler.add_screenshot(screenshot=scanned_screenshot)
-        return _empty(status.HTTP_201_CREATED)
+    if parsed.kind == "saves":
+        return await _put_save(request, rom, parsed)
 
-    asset_path = sync_handler.build_asset_file_path(
-        request.user, rom, parsed.kind, parsed.emulator
+    # A state resolved by slot may have its own file name and emulator; writing
+    # to them keeps the row pointing at the fresh bytes instead of orphaning them.
+    slot = await asyncio.to_thread(
+        sync_handler.slot_states,
+        request.user,
+        rom,
+        parsed.emulator,
+        file_name,
     )
-
-    # A state resolved by slot may have its own file name; writing to it keeps
-    # the row pointing at the fresh bytes instead of orphaning them.
-    existing = _get_asset(request.user, rom, parsed)
+    existing = slot.own_head
     write_file_name = existing.file_name if existing else file_name
-    replaced_hash = (
-        await fs_asset_handler.unrecorded_hash(existing)
-        if isinstance(existing, Save)
-        else None
+    emulator = existing.emulator if existing else parsed.emulator
+    asset_path = sync_handler.build_asset_file_path(
+        request.user, rom, parsed.kind, emulator
     )
 
     async with _request_body(request) as body:
+        content_hash, is_copy = await sync_handler.check_against_capture(slot, body)
+        if is_copy:
+            return _empty(status.HTTP_204_NO_CONTENT)
         await fs_asset_handler.write_file(
             file=body, path=asset_path, filename=write_file_name
         )
 
-    scan = scan_save if parsed.kind == "saves" else scan_state
-    scanned = await scan(
+    scanned = await scan_state(
         file_name=write_file_name,
         user=request.user,
         platform_fs_slug=rom.platform.fs_slug,
         rom_id=rom.id,
-        emulator=parsed.emulator,
+        emulator=emulator,
+        content_hash=content_hash,
     )
-    if existing:
-        # The row moves with the bytes when it was filed elsewhere, e.g. under
-        # the ROM's previous platform folder.
-        fields = {
-            "file_size_bytes": scanned.file_size_bytes,
-            "file_path": scanned.file_path,
-            "missing_from_fs": False,
-        }
-        if isinstance(scanned, Save):
-            db_save_handler.update_save(
-                existing.id,
-                {**fields, "content_hash": scanned.content_hash},
-                replaced_hash=replaced_hash,
-            )
-        else:
-            db_state_handler.update_state(existing.id, fields)
-        if existing.file_path != scanned.file_path:
-            with suppress(FileNotFoundError):
-                await fs_asset_handler.remove_file(file_path=existing.full_path)
-    else:
-        scanned.rom_id = rom.id
-        scanned.user_id = request.user.id
-        scanned.emulator = parsed.emulator
-        if isinstance(scanned, Save):
-            db_save_handler.add_save(save=scanned)
-        else:
-            db_state_handler.add_state(state=scanned)
+    await asyncio.to_thread(_record_state, request.user, rom, parsed, existing, scanned)
+    # The row moves with the bytes when it was filed elsewhere, e.g. under the
+    # ROM's previous platform folder.
+    if existing and existing.file_path != scanned.file_path:
+        with suppress(FileNotFoundError):
+            await fs_asset_handler.remove_file(file_path=existing.full_path)
 
     # `last_played` is left alone on purpose: a first sync uploads the whole
     # backlog at once, which would stamp every game as just-played.
     return _empty(status.HTTP_204_NO_CONTENT if existing else status.HTTP_201_CREATED)
+
+
+def _record_screenshot(
+    user: User, rom: Rom, scanned: Screenshot, file_name: str, file_path: str
+) -> bool:
+    """Upsert a state screenshot's row, returning whether it was created."""
+    existing = next(
+        (
+            shot
+            for shot in db_screenshot_handler.get_screenshots(
+                user_id=user.id, rom_ids={rom.id}
+            )
+            if shot.file_name == file_name and shot.file_path == file_path
+        ),
+        None,
+    )
+    if existing:
+        db_screenshot_handler.update_screenshot(
+            existing.id,
+            {"file_size_bytes": scanned.file_size_bytes, "missing_from_fs": False},
+        )
+        return False
+
+    scanned.rom_id = rom.id
+    scanned.user_id = user.id
+    db_screenshot_handler.add_screenshot(screenshot=scanned)
+    return True
+
+
+def _record_state(
+    user: User,
+    rom: Rom,
+    parsed: RetroArchSyncPath,
+    existing: State | None,
+    scanned: State,
+) -> None:
+    """Point the existing row at the freshly written bytes, or add a new one."""
+    if existing:
+        db_state_handler.update_state(
+            existing.id,
+            {
+                "file_size_bytes": scanned.file_size_bytes,
+                "file_path": scanned.file_path,
+                "content_hash": scanned.content_hash,
+                "missing_from_fs": False,
+            },
+        )
+        return
+
+    scanned.rom_id = rom.id
+    scanned.user_id = user.id
+    scanned.emulator = parsed.emulator
+    db_state_handler.add_state(state=scanned)
+
+
+async def _put_save(request: Request, rom: Rom, parsed: RetroArchSyncPath) -> Response:
+    async with _request_body(request) as body:
+        try:
+            stored = await sync_handler.store_save(
+                request.user, rom, parsed.emulator, parsed.file_name, body
+            )
+        except ValueError:
+            return _empty(status.HTTP_409_CONFLICT)
+
+    return _empty(
+        status.HTTP_201_CREATED if stored == "created" else status.HTTP_204_NO_CONTENT
+    )
 
 
 @router.api_route(
@@ -652,27 +720,65 @@ async def retroarch_sync_delete(request: Request, file_path: str) -> Response:
     if not parsed:
         return _empty(status.HTTP_404_NOT_FOUND)
 
-    rom = _resolve_rom(request, parsed.kind, parsed.file_name)
+    rom = await _resolve_rom(request, parsed.kind, parsed.file_name)
     if not rom:
         return _empty(status.HTTP_404_NOT_FOUND)
 
-    asset = _get_asset(request.user, rom, parsed)
-    if not asset:
+    if parsed.kind == "saves":
+        saves = await asyncio.to_thread(
+            sync_handler.saves_at_path,
+            request.user,
+            rom,
+            parsed.emulator,
+            parsed.file_name,
+        )
+        if not saves:
+            return _empty(status.HTTP_404_NOT_FOUND)
+
+        log.info(f"Cloud sync delete {hl(parsed.file_name)} [{rom.platform_slug}]")
+        for save in saves:
+            await remove_save(save)
+        return _empty(status.HTTP_204_NO_CONTENT)
+
+    if parsed.is_state_screenshot:
+        owning_state, screenshot = await asyncio.to_thread(
+            sync_handler.slot_screenshot,
+            request.user,
+            rom,
+            parsed.emulator,
+            parsed.file_name,
+        )
+        if owning_state is None:
+            return _empty(status.HTTP_404_NOT_FOUND)
+        if owning_state.is_stream_capture:
+            # A capture is never deleted here, so its screenshot stays too.
+            return _empty(status.HTTP_204_NO_CONTENT)
+        if not screenshot:
+            return _empty(status.HTTP_404_NOT_FOUND)
+
+        log.info(f"Cloud sync delete {hl(screenshot.file_name)} [{rom.platform_slug}]")
+        await asyncio.to_thread(db_screenshot_handler.delete_screenshot, screenshot.id)
+        with suppress(FileNotFoundError):
+            await fs_asset_handler.remove_file(file_path=screenshot.full_path)
+        return _empty(status.HTTP_204_NO_CONTENT)
+
+    # Every alias in the slot goes, or an older one would resurface at this path.
+    # Captures stay, so the newest of them is served here next.
+    slot = await asyncio.to_thread(
+        sync_handler.slot_states,
+        request.user,
+        rom,
+        parsed.emulator,
+        parsed.file_name,
+    )
+    if slot.served is None:
         return _empty(status.HTTP_404_NOT_FOUND)
 
-    log.info(f"Cloud sync delete {hl(asset.file_name)} [{rom.platform_slug}]")
-
-    if isinstance(asset, Screenshot):
-        db_screenshot_handler.delete_screenshot(asset.id)
-    elif isinstance(asset, Save):
-        db_save_handler.delete_save(
-            asset.id, content_hash=await fs_asset_handler.unrecorded_hash(asset)
-        )
-    else:
-        db_state_handler.delete_state(asset.id)
-
-    with suppress(FileNotFoundError):
-        await fs_asset_handler.remove_file(file_path=asset.full_path)
+    log.info(f"Cloud sync delete {hl(parsed.file_name)} [{rom.platform_slug}]")
+    for state in slot.own:
+        await asyncio.to_thread(db_state_handler.delete_state, state.id)
+        with suppress(FileNotFoundError):
+            await fs_asset_handler.remove_file(file_path=state.full_path)
 
     return _empty(status.HTTP_204_NO_CONTENT)
 

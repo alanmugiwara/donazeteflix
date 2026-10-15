@@ -1,4 +1,3 @@
-import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { NotificationSchema } from "@/__generated__";
 import storeNotificationInbox from "@/v2/stores/notificationInbox";
@@ -32,7 +31,6 @@ function notification(
 
 describe("notificationInbox", () => {
   beforeEach(() => {
-    setActivePinia(createPinia());
     vi.resetAllMocks();
   });
 
@@ -77,9 +75,11 @@ describe("notificationInbox", () => {
   });
 
   it("sends a notification marked as this tab's own", async () => {
-    create.mockImplementation(async (payload) => ({
-      data: [notification(5, { data: payload.data })],
-    }));
+    create.mockImplementation((payload) =>
+      Promise.resolve({
+        data: [notification(5, { data: payload.data })],
+      }),
+    );
     const inbox = storeNotificationInbox();
 
     await inbox.send({ title: "Sync finished", level: "success" });
@@ -90,8 +90,8 @@ describe("notificationInbox", () => {
       data: { origin_tab: expect.any(String) },
     });
     const [sent] = inbox.notifications;
-    expect(sent.id).toBe(5);
-    expect(inbox.sentFromThisTab(sent)).toBe(true);
+    expect(sent?.id).toBe(5);
+    expect(inbox.sentFromThisTab(sent!)).toBe(true);
     expect(inbox.sentFromThisTab(notification(6))).toBe(false);
   });
 

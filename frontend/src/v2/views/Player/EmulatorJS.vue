@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// EmulatorJS — v2 shell around the v1 <Player> component. The emulator
+// EmulatorJS: v2 shell around the v1 <Player> component. The emulator
 // integration (EJS_* globals, loader fallback, save/state sync, firmware
 // resolution) is ported verbatim from `src/views/Player/EmulatorJS/Base.vue`
 // so behaviour stays identical; only the chrome is v2.
@@ -8,7 +8,7 @@
 // the in-browser one; a platform the shell alone can run opens this page with
 // the hero by itself, since nothing EmulatorJS owns applies to that launch.
 //
-// Layout — three columns:
+// Layout: three columns:
 //   1. Hero: cover + title + play CTAs + back links.
 //   2. Resume: tabs (Saves/States), big <AssetPreview> of the selected
 //      asset, and an <AssetStrip> below to swap between options inline.
@@ -28,9 +28,8 @@ import {
   RSwitch,
   RTextField,
 } from "@v2/lib";
-import { useEventListener, useLocalStorage } from "@vueuse/core";
+import { useEventListener } from "@vueuse/core";
 import type { Emitter } from "mitt";
-import { storeToRefs } from "pinia";
 import {
   computed,
   defineAsyncComponent,
@@ -44,12 +43,15 @@ import {
 import { useI18n } from "vue-i18n";
 import { onBeforeRouteLeave } from "vue-router";
 import type { FirmwareSchema, SaveSchema, StateSchema } from "@/__generated__";
+import {
+  userStorage,
+  useUserLocalStorage,
+} from "@/composables/useUserLocalStorage";
 import firmwareApi from "@/services/api/firmware";
 import romApi from "@/services/api/rom";
 import { AUTOSAVE_SLOT, SAVE_SLOT_MAX_LENGTH } from "@/services/api/save";
 import storeConfig from "@/stores/config";
 import { useNativeStore } from "@/stores/native";
-import storePlaying from "@/stores/playing";
 import type { DetailedRom } from "@/stores/roms";
 import type { Events } from "@/types/emitter";
 import {
@@ -64,6 +66,7 @@ import GameCover from "@/v2/components/shared/GameCover.vue";
 import { useActivityPresence } from "@/v2/composables/useActivityPresence";
 import { useCanPlay } from "@/v2/composables/useCanPlay";
 import { useCoverArt } from "@/v2/composables/useCoverArt";
+import { useEmitterEvent } from "@/v2/composables/useEmitterEvent";
 import { useFullscreenFallback } from "@/v2/composables/useFullscreenFallback";
 import { useFullscreenPref } from "@/v2/composables/useFullscreenPref";
 import {
@@ -77,7 +80,10 @@ import { usePlayerHero } from "@/v2/composables/usePlayerHero";
 import { usePlayerNav } from "@/v2/composables/usePlayerNav";
 import { useSaveStateTabs } from "@/v2/composables/useSaveStateTabs";
 import { useSnackbar } from "@/v2/composables/useSnackbar";
-import { useStageActive } from "@/v2/composables/useStageActive";
+import {
+  usePlayingWhile,
+  useStageActive,
+} from "@/v2/composables/useStageActive";
 import { useUnloadGuard } from "@/v2/composables/useUnloadGuard";
 import type { AssetType } from "@/v2/utils/assets";
 import { joinNames } from "@/v2/utils/lists";
@@ -126,7 +132,7 @@ import {
   type ResumeSelection,
 } from "./resumeSelection";
 
-// Reuse v1's heavy emulator integration — do NOT rewrite this. Lazy so the
+// Reuse v1's heavy emulator integration; do NOT rewrite this. Lazy so the
 // bundle doesn't pull in the EJS shims until we actually mount the player.
 const Player = defineAsyncComponent(
   () => import("@/views/Player/EmulatorJS/Player.vue"),
@@ -135,10 +141,8 @@ const Player = defineAsyncComponent(
 const { t, locale } = useI18n();
 const snackbar = useSnackbar();
 const emitter = inject<Emitter<Events>>("emitter");
-const playingStore = storePlaying();
 const configStore = storeConfig();
 const nativeStore = useNativeStore();
-const { playing } = storeToRefs(playingStore);
 const { fullscreenOnPlay } = useFullscreenPref();
 useFullscreenFallback();
 const playSession = usePlaySession();
@@ -156,7 +160,16 @@ const isSavesTabSelected = ref(true);
 const selectedDisc = ref<DiscSelection>(null);
 const selectedCore = ref<string | null>(null);
 const selectedFirmware = ref<FirmwareSchema | null>(null);
-const supportedCores = ref<string[]>([]);
+const supportedCores = computed<string[]>(() =>
+  rom.value
+    ? [
+        ...getSupportedEJSCores(
+          rom.value.platform_slug,
+          configStore.config.EJS_NETPLAY_ENABLED,
+        ),
+      ]
+    : [],
+);
 const gameRunning = ref(false);
 // Threaded cores need SharedArrayBuffer, so their launch may first have to
 // reload the view into a cross-origin isolated document.
@@ -190,6 +203,7 @@ const exit = usePlayerExit(
 // quiet for the full navigation it turns into.
 useUnloadGuard(() => gameRunning.value && !exit.departing.value);
 useStageActive(gameRunning);
+usePlayingWhile(gameRunning);
 onBeforeRouteLeave(exit.guard);
 
 // Stage-scoped so the non-passive listener never taxes touches elsewhere.
@@ -244,7 +258,7 @@ const discItems = computed<{ title: string; value: DiscSelection }[]>(() => [
 // details). We keep a lightweight `useCoverArt` here only to know whether
 // the active style is alt-art, so the purple glow can be dropped for a
 // floating disc / cartridge / mix image. The launch flourish is triggered
-// imperatively on the GameCover via `coverRef` — see onPlay.
+// imperatively on the GameCover via `coverRef`, see onPlay.
 const art = useCoverArt(() => heroRom.value, { context: "player" });
 const heroIsAlt = computed(
   () =>
@@ -264,7 +278,7 @@ const bezelUrl = computed(() =>
 // the route param so it binds before `rom` resolves; stored as the compact "0"
 // hidden / "1" shown marker (anything else fails safe to shown), and defaults
 // are not written so merely opening a game leaves storage untouched.
-const showBezel = useLocalStorage(`player:${romId}:bezel`, true, {
+const showBezel = useUserLocalStorage(`player:${romId}:bezel`, true, {
   writeDefaults: false,
   serializer: {
     read: resolveStoredBezelVisible,
@@ -403,7 +417,8 @@ async function onPlayNative() {
   rememberCore(romId, rom.value.platform_slug, selectedCore.value);
   rememberDisc(romId, selectedDisc.value);
   const refusal = await nativeStore.launch(rom.value, {
-    core: selectedCore.value,
+    // No core leaves the shell to pick one from the platform's candidates.
+    core: selectedCore.value ?? undefined,
     fullscreen: fullscreenOnPlay.value,
     disc: selectedDisc.value,
   });
@@ -462,7 +477,6 @@ async function onPlay() {
 
   gameRunning.value = true;
   window.EJS_fullscreenOnLoaded = fullscreenOnPlay.value;
-  playing.value = true;
 
   const { EJS_NETPLAY_ENABLED } = configStore.config;
   const EMULATORJS_VERSION = EJS_NETPLAY_ENABLED ? "nightly" : "4.2.3";
@@ -491,7 +505,6 @@ async function onPlay() {
     // No emulator booted, so drop back to the config screen instead of
     // leaving the unload guard and the input mute armed.
     gameRunning.value = false;
-    playing.value = false;
   }
 }
 
@@ -538,6 +551,9 @@ function selectState(state: StateSchema) {
 function unselectState() {
   resume.value = { ...resume.value, state: null };
 }
+
+useEmitterEvent("saveSelected", selectSave);
+useEmitterEvent("stateSelected", selectState);
 
 watch(selectedCore, (newSelectedCore) => {
   const armed = resume.value.state;
@@ -588,28 +604,6 @@ onMounted(async () => {
   firmwareOptions.value = firmwareResponse.data;
 
   const platformSlug = rom.value.platform_slug;
-  supportedCores.value = [
-    ...getSupportedEJSCores(
-      platformSlug,
-      configStore.config.EJS_NETPLAY_ENABLED,
-    ),
-  ];
-
-  emitter?.on("saveSelected", selectSave);
-  emitter?.on("stateSelected", selectState);
-  window.addEventListener("gamepad:buttondown", onGamepadButton);
-
-  if ("keyboard" in navigator) {
-    useEventListener(document, "fullscreenchange", () => {
-      if (document.fullscreenElement) {
-        navigator.keyboard
-          .lock(["Escape", "Tab", "AltLeft", "ControlLeft", "MetaLeft"])
-          .catch(() => {});
-      } else {
-        navigator.keyboard.unlock();
-      }
-    });
-  }
 
   // compatibleStates filters on selectedCore, so resolve the core first.
   selectedCore.value = resolveRememberedCore(
@@ -632,7 +626,7 @@ onMounted(async () => {
   );
 
   const coreOptions = configStore.getEJSCoreOptions(selectedCore.value);
-  const storedBiosID = localStorage.getItem(`player:${platformSlug}:bios_id`);
+  const storedBiosID = userStorage.getItem(`player:${platformSlug}:bios_id`);
 
   selectedFirmware.value = resolveInitialFirmware({
     options: firmwareOptions.value,
@@ -658,12 +652,25 @@ watch(gameRunning, (running, prev) => {
   if (prev && !running) endSession();
 });
 
-// Y toggles the saves/states tab — view-local binding wired through
+// Y toggles the saves/states tab, view-local binding wired through
 // the `gamepad:buttondown` window event dispatched by useGamepad.
 function onGamepadButton(e: CustomEvent<{ name?: string }>) {
   if (e.detail?.name !== "y") return;
   if (gameRunning.value) return;
   setAssetTab(activeAssetTab.value === "save" ? "state" : "save");
+}
+useEventListener(window, "gamepad:buttondown", onGamepadButton);
+
+if ("keyboard" in navigator) {
+  useEventListener(document, "fullscreenchange", () => {
+    if (document.fullscreenElement) {
+      navigator.keyboard
+        .lock(["Escape", "Tab", "AltLeft", "ControlLeft", "MetaLeft"])
+        .catch(() => {});
+    } else {
+      navigator.keyboard.unlock();
+    }
+  });
 }
 
 onBeforeUnmount(() => {
@@ -671,13 +678,7 @@ onBeforeUnmount(() => {
   // the user never exited the game to the config screen first. flush() is
   // idempotent, so an exit that already flushed via the watch is a no-op.
   endSession();
-  // Hand the keyboard and gamepad back to the UI; the flag otherwise
-  // stays true and pad/hotkey navigation is dead until a reload.
-  playing.value = false;
   exitEmulatorOnce();
-  emitter?.off("saveSelected", selectSave);
-  emitter?.off("stateSelected", selectState);
-  window.removeEventListener("gamepad:buttondown", onGamepadButton);
 });
 
 function openCacheDialog() {
@@ -1117,7 +1118,7 @@ const saveSlot = computed(() => chosenSlot(slotChoice.value, customSlot.value));
   padding: 32px var(--r-row-pad) 48px;
 }
 
-/* Pre-game layout — hero | resume | setup. The resume column owns
+/* Pre-game layout: hero | resume | setup. The resume column owns
    most of the visual weight because the user's primary question is
    "which save/state am I about to resume from?". */
 .r-v2-ejs__config {
@@ -1142,7 +1143,7 @@ const saveSlot = computed(() => chosenSlot(slotChoice.value, customSlot.value));
   margin: 0 auto;
 }
 
-/* Shared glass-panel skin — single visual vocabulary across panels. */
+/* Shared glass-panel skin: single visual vocabulary across panels. */
 .r-v2-ejs__panel {
   background: var(--r-color-bg-elevated) !important;
   border: 1px solid var(--r-color-border) !important;
@@ -1205,7 +1206,7 @@ const saveSlot = computed(() => chosenSlot(slotChoice.value, customSlot.value));
   z-index: -1;
   pointer-events: none;
 }
-/* Alt-art (disc / cartridge / 3D / mix) floats free — no frame, no glow.
+/* Alt-art (disc / cartridge / 3D / mix) floats free, no frame, no glow.
    The glow stays for the procedural placeholder (no cover), which keeps
    `heroIsAlt` false. */
 .r-v2-ejs__cover--alt-art .r-v2-ejs__cover-glow {
@@ -1421,7 +1422,7 @@ html[data-bp~="md-and-up"]
 /* ── Running state ───────────────────────────────────────── */
 .r-v2-ejs__stage {
   position: fixed;
-  inset: var(--r-nav-h) 0 0 0;
+  inset: var(--r-stage-inset);
   background: var(--r-color-canvas-bg);
   z-index: 1;
 }

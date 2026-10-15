@@ -1,14 +1,14 @@
 import { mount } from "@vue/test-utils";
-import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { DetailedRomSchema, UserStateSchema } from "@/__generated__";
+import type { UserSaveSchema, UserStateSchema } from "@/__generated__";
 import storeAuth from "@/stores/auth";
-import type { User } from "@/stores/users";
+import { saveFixture, stateFixture } from "@/utils/assets.fixtures";
+import { detailedRomFixture } from "@/utils/rom.fixtures";
+import { userFixture } from "@/utils/user.fixtures";
+import { toUserSave, toUserState } from "@/v2/utils/saveStates.fixtures";
 import SaveDataTab from "./SaveDataTab.vue";
 
-vi.mock("vue-i18n", () => ({
-  useI18n: () => ({ t: (key: string) => key }),
-}));
+vi.mock("vue-i18n");
 vi.mock("vue-router", async (importOriginal) => ({
   ...(await importOriginal<typeof import("vue-router")>()),
   useRoute: () => ({ query: {}, path: "/rom/1", params: {} }),
@@ -19,8 +19,13 @@ vi.mock("@/v2/composables/useRomSync", () => ({
   useRomSync: () => ({ refetchRom: vi.fn() }),
 }));
 vi.mock("@/v2/composables/useSnackbar", () => ({
-  useSnackbar: () => ({ success: vi.fn(), error: vi.fn() }),
+  useSnackbar: () => ({ success: vi.fn(), error: vi.fn(), warning: vi.fn() }),
 }));
+const { uploadSaves } = vi.hoisted(() => ({ uploadSaves: vi.fn() }));
+vi.mock("@/services/api/save", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/services/api/save")>();
+  return { ...actual, default: { ...actual.default, uploadSaves } };
+});
 
 const UploadAssetDialog = {
   props: { cores: { type: Array, default: () => [] } },
@@ -28,24 +33,22 @@ const UploadAssetDialog = {
 };
 
 function state(id: number, emulator: string): UserStateSchema {
-  return {
-    id,
-    user_id: 1,
-    file_name: `state_${id}.state`,
-    updated_at: "2026-09-16T10:00:00Z",
-    emulator,
-  } as UserStateSchema;
+  return toUserState(stateFixture({ id, emulator }), "player");
 }
 
-function mountTab(states: UserStateSchema[]) {
+function save(id: number, emulator: string): UserSaveSchema {
+  return toUserSave(saveFixture({ id, emulator }), "player");
+}
+
+function mountTab(states: UserStateSchema[], saves: UserSaveSchema[] = []) {
   return mount(SaveDataTab, {
     props: {
-      rom: {
+      rom: detailedRomFixture({
         id: 1,
         platform_slug: "ps2",
-        all_user_saves: [],
+        all_user_saves: saves,
         all_user_states: states,
-      } as unknown as DetailedRomSchema,
+      }),
     },
     global: {
       stubs: {
@@ -62,8 +65,7 @@ function mountTab(states: UserStateSchema[]) {
 
 describe("SaveDataTab upload cores", () => {
   beforeEach(() => {
-    setActivePinia(createPinia());
-    storeAuth().setCurrentUser({ id: 1 } as User);
+    storeAuth().setCurrentUser(userFixture({ id: 1 }));
   });
 
   it("offers an emulator configured in another case once", () => {
@@ -72,5 +74,33 @@ describe("SaveDataTab upload cores", () => {
     expect(wrapper.findComponent(UploadAssetDialog).props("cores")).toEqual([
       "play",
     ]);
+  });
+
+  it("offers the cores existing saves carry", () => {
+    const wrapper = mountTab([state(1, "play")], [save(2, "pcsx2")]);
+
+    expect(wrapper.findComponent(UploadAssetDialog).props("cores")).toEqual([
+      "pcsx2",
+      "play",
+    ]);
+  });
+
+  it("files an uploaded save under the picked core", async () => {
+    uploadSaves.mockResolvedValue([]);
+    const wrapper = mountTab([]);
+    const file = new File(["x"], "a.srm");
+
+    wrapper.findComponent(UploadAssetDialog).vm.$emit("submit", {
+      type: "save",
+      files: [file],
+      slot: null,
+      emulator: "mgba",
+    });
+
+    await vi.waitFor(() =>
+      expect(uploadSaves).toHaveBeenCalledWith(
+        expect.objectContaining({ emulator: "mgba", slot: undefined }),
+      ),
+    );
   });
 });
